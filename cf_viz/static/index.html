@@ -1,0 +1,1106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AOOB Graph Chat</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #070b14;
+      --panel: #0e1524;
+      --line: #1c2740;
+      --text: #e8edf7;
+      --muted: #8b97b0;
+      --accent: #12b5a3;
+      --read: #38bdf8;
+      --write: #fb923c;
+      --mixed: #c084fc;
+      --alarm: #f43f5e;
+      --first: #fbbf24;
+      --tool: #60a5fa;
+      --user: #134e4a;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; height: 100%; overflow: hidden;
+      background: var(--bg); color: var(--text);
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+    }
+    .mono { font-family: "IBM Plex Mono", ui-monospace, monospace; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(320px, 380px) 1fr minmax(300px, 380px);
+      height: 100vh;
+    }
+    @media (max-width: 1200px) {
+      .layout {
+        grid-template-columns: 1fr;
+        grid-template-rows: 42vh 40vh auto;
+        overflow: auto;
+        height: 100vh;
+      }
+      aside.left, aside.right { max-height: none; border: 0; border-bottom: 1px solid var(--line); }
+      #stage { min-height: 40vh; }
+    }
+    aside.left, aside.right {
+      background: linear-gradient(175deg, #121a2d 0%, #0a1020 100%);
+      z-index: 2;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+    aside.left { border-right: 1px solid var(--line); }
+    aside.right {
+      border-left: 1px solid var(--line);
+      padding: 1.05rem 1.1rem 1.3rem;
+      overflow: auto;
+    }
+    .chat-header {
+      padding: 1rem 1.1rem 0.75rem;
+      border-bottom: 1px solid var(--line);
+      flex-shrink: 0;
+    }
+    h1 {
+      margin: 0 0 0.2rem;
+      font-size: 1.1rem;
+      font-weight: 600;
+      letter-spacing: -0.03em;
+    }
+    h2 {
+      margin: 0 0 0.45rem;
+      font-size: 0.92rem;
+      font-weight: 600;
+    }
+    .sub { color: var(--muted); font-size: 0.8rem; margin: 0; line-height: 1.4; }
+    .stats {
+      display: flex; gap: 0.35rem; flex-wrap: wrap;
+      margin-top: 0.65rem;
+    }
+    .stat {
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.025);
+      border-radius: 8px;
+      padding: 0.28rem 0.45rem;
+      min-width: 3.8rem;
+    }
+    .stat b { display: block; font-size: 0.88rem; }
+    .stat span { color: var(--muted); font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.04em; }
+
+    #chat-log {
+      flex: 1;
+      overflow: auto;
+      padding: 0.85rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.55rem;
+      min-height: 0;
+    }
+    .bubble {
+      border-radius: 12px;
+      padding: 0.55rem 0.7rem;
+      font-size: 0.82rem;
+      line-height: 1.45;
+      max-width: 100%;
+      animation: fadeIn 0.18s ease;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: none; }
+    }
+    .bubble.user {
+      align-self: flex-end;
+      background: linear-gradient(160deg, #0f766e, #115e59);
+      color: #ecfdf5;
+      max-width: 92%;
+    }
+    .bubble.system {
+      align-self: stretch;
+      background: rgba(255,255,255,0.03);
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+    .bubble.status {
+      align-self: stretch;
+      border-left: 3px solid var(--accent);
+      background: rgba(18,181,163,0.08);
+      color: #99f6e4;
+      font-size: 0.78rem;
+      padding: 0.4rem 0.65rem;
+    }
+    .bubble.tool-call {
+      border: 1px solid rgba(96,165,250,0.35);
+      background: rgba(96,165,250,0.08);
+    }
+    .bubble.tool-call .tag {
+      color: var(--tool);
+      font-size: 0.68rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.25rem;
+    }
+    .bubble.tool-result {
+      border: 1px solid var(--line);
+      background: #080e1a;
+    }
+    .bubble.tool-result .tag {
+      color: var(--muted);
+      font-size: 0.68rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.25rem;
+    }
+    .bubble.agent {
+      border: 1px solid rgba(251,191,36,0.35);
+      background: rgba(251,191,36,0.07);
+    }
+    .bubble.agent .tag {
+      color: var(--first);
+      font-size: 0.68rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.25rem;
+    }
+    .bubble.report {
+      border: 1px solid rgba(18,181,163,0.45);
+      background: rgba(18,181,163,0.1);
+    }
+    .bubble.report .tag {
+      color: #5eead4;
+      font-size: 0.68rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 0.35rem;
+    }
+    .bubble.error {
+      border: 1px solid rgba(244,63,94,0.45);
+      background: rgba(244,63,94,0.1);
+      color: #fecdd3;
+    }
+    .bubble pre {
+      margin: 0.35rem 0 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 0.72rem;
+      color: #cbd5e1;
+      max-height: 220px;
+      overflow: auto;
+    }
+    .report-grid {
+      display: grid;
+      gap: 0.35rem;
+      font-size: 0.8rem;
+    }
+    .report-grid dt { color: var(--muted); font-size: 0.7rem; }
+    .report-grid dd { margin: 0 0 0.25rem; }
+
+    .chat-composer {
+      border-top: 1px solid var(--line);
+      padding: 0.75rem 1rem 1rem;
+      flex-shrink: 0;
+    }
+    .toggles {
+      display: flex; flex-wrap: wrap; gap: 0.45rem 0.75rem;
+      margin: 0 0 0.55rem;
+      font-size: 0.74rem; color: var(--muted);
+    }
+    .toggles label { display: inline-flex; align-items: center; gap: 0.28rem; cursor: pointer; }
+    .row { display: flex; gap: 0.4rem; }
+    input[type="text"], select {
+      flex: 1; min-width: 0;
+      background: #080e1a;
+      border: 1px solid var(--line);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 0.55rem 0.7rem;
+      font: inherit;
+    }
+    input:focus, select:focus { outline: 1px solid rgba(18,181,163,0.7); }
+    button {
+      border: 0; border-radius: 10px;
+      padding: 0.55rem 0.85rem;
+      font: inherit; font-weight: 600;
+      cursor: pointer;
+      background: linear-gradient(180deg, #1ad0bc, #0f9f91);
+      color: #042f2c;
+      white-space: nowrap;
+    }
+    button.secondary {
+      background: transparent; color: var(--text);
+      border: 1px solid var(--line); font-weight: 500;
+    }
+    button:disabled { opacity: 0.55; cursor: wait; }
+    .composer-hint {
+      margin: 0.4rem 0 0;
+      font-size: 0.72rem;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+    .progress {
+      height: 3px; background: #152036; border-radius: 99px; overflow: hidden;
+      margin: 0.55rem 0 0;
+    }
+    .progress > i {
+      display: block; height: 100%; width: 0%;
+      background: linear-gradient(90deg, #12b5a3, #f0733a);
+      transition: width 0.2s ease;
+    }
+
+    #stage {
+      position: relative;
+      background:
+        radial-gradient(1000px 480px at 80% -5%, rgba(18,181,163,0.14), transparent 55%),
+        radial-gradient(800px 420px at 5% 105%, rgba(240,115,58,0.09), transparent 50%),
+        var(--bg);
+    }
+    #network { width: 100%; height: 100%; }
+    #hud {
+      position: absolute; left: 12px; bottom: 12px;
+      display: flex; gap: 0.35rem; z-index: 3;
+    }
+    #hud button { padding: 0.38rem 0.65rem; font-size: 0.78rem; }
+    #tooltip {
+      position: absolute; pointer-events: none; z-index: 5;
+      background: rgba(8,14,26,0.92);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0.32rem 0.5rem;
+      font-size: 0.76rem;
+      display: none;
+      max-width: 360px;
+    }
+
+    .empty-right {
+      color: var(--muted);
+      font-size: 0.84rem;
+      line-height: 1.45;
+      padding: 0.4rem 0;
+    }
+    .first-card {
+      border: 1px solid rgba(251,191,36,0.45);
+      background: linear-gradient(160deg, rgba(251,191,36,0.12), rgba(251,191,36,0.03));
+      border-radius: 12px;
+      padding: 0.75rem 0.8rem;
+      margin-bottom: 0.9rem;
+    }
+    .first-card .tag {
+      display: inline-block;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--first);
+      margin-bottom: 0.35rem;
+    }
+    .first-card .fn { font-size: 0.92rem; font-weight: 600; margin-bottom: 0.25rem; word-break: break-all; }
+    .first-card .meta { font-size: 0.76rem; color: var(--muted); line-height: 1.4; }
+    .badge {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 0.1rem 0.45rem;
+      font-size: 0.68rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .badge.read { background: rgba(56,189,248,0.15); color: var(--read); border: 1px solid rgba(56,189,248,0.4); }
+    .badge.write { background: rgba(251,146,60,0.15); color: var(--write); border: 1px solid rgba(251,146,60,0.4); }
+    .badge.mixed { background: rgba(192,132,252,0.15); color: var(--mixed); border: 1px solid rgba(192,132,252,0.4); }
+    .badge.other { background: rgba(148,163,184,0.12); color: #94a3b8; border: 1px solid rgba(148,163,184,0.35); }
+    .badge.alarm { background: rgba(244,63,94,0.15); color: #fb7185; border: 1px solid rgba(244,63,94,0.45); }
+
+    .mini-stats {
+      display: flex; gap: 0.35rem; flex-wrap: wrap; margin: 0 0 0.75rem;
+    }
+    .mini-stats .chip {
+      font-size: 0.72rem;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0.25rem 0.45rem;
+      color: var(--muted);
+    }
+    .mini-stats .chip b { color: var(--text); }
+
+    .timeline { position: relative; padding-left: 0.15rem; margin-bottom: 1rem; }
+    .tl-item {
+      position: relative;
+      display: grid;
+      grid-template-columns: 28px 1fr;
+      gap: 0.45rem;
+      padding-bottom: 0.85rem;
+    }
+    .tl-item:last-child { padding-bottom: 0.2rem; }
+    .tl-rail { position: relative; display: flex; justify-content: center; }
+    .tl-rail::before {
+      content: "";
+      position: absolute;
+      top: 14px; bottom: -8px;
+      width: 2px;
+      background: #1e2a42;
+    }
+    .tl-item:last-child .tl-rail::before { display: none; }
+    .tl-dot {
+      width: 14px; height: 14px;
+      border-radius: 999px;
+      margin-top: 4px;
+      border: 2px solid #0a1020;
+      z-index: 1;
+      box-shadow: 0 0 0 2px currentColor;
+    }
+    .tl-dot.read { background: var(--read); color: rgba(56,189,248,0.45); }
+    .tl-dot.write { background: var(--write); color: rgba(251,146,60,0.45); }
+    .tl-dot.mixed, .tl-dot.other { background: var(--mixed); color: rgba(192,132,252,0.4); }
+    .tl-dot.first { box-shadow: 0 0 0 2px rgba(251,191,36,0.7); }
+    .tl-body {
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.02);
+      border-radius: 10px;
+      padding: 0.55rem 0.6rem;
+    }
+    .tl-body.has-alarm {
+      border-color: rgba(244,63,94,0.45);
+      background: rgba(244,63,94,0.06);
+    }
+    .tl-top {
+      display: flex; justify-content: space-between; gap: 0.4rem; align-items: center;
+      margin-bottom: 0.25rem;
+    }
+    .tl-step { font-size: 0.7rem; color: var(--muted); }
+    .tl-fn { font-size: 0.82rem; font-weight: 600; word-break: break-all; margin-bottom: 0.2rem; }
+    .tl-loc { font-size: 0.72rem; color: var(--muted); word-break: break-all; }
+    .tl-alarms { margin-top: 0.4rem; display: grid; gap: 0.3rem; }
+    .alarm-row {
+      font-size: 0.72rem;
+      border: 1px solid rgba(244,63,94,0.35);
+      background: rgba(244,63,94,0.08);
+      border-radius: 8px;
+      padding: 0.35rem 0.45rem;
+      line-height: 1.35;
+    }
+    .alarm-row.query {
+      border-color: rgba(251,191,36,0.55);
+      background: rgba(251,191,36,0.1);
+    }
+    .alarm-row b { color: #fecdd3; }
+    .alarm-row.query b { color: var(--first); }
+    .alarm-section { margin-top: 0.4rem; }
+    .alarm-list { display: grid; gap: 0.4rem; }
+    .legend {
+      display: grid; gap: 0.22rem;
+      font-size: 0.72rem; color: var(--muted);
+      margin-top: 0.75rem;
+      padding-top: 0.65rem;
+      border-top: 1px solid var(--line);
+    }
+    .legend i {
+      display: inline-block; width: 0.62rem; height: 0.62rem;
+      border-radius: 999px; margin-right: 0.3rem; vertical-align: -1px;
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside class="left">
+      <div class="chat-header">
+        <h1>AOOB investigator</h1>
+        <p class="sub">Ask with an Order id. The agent streams tool calls, evidence, and reasoning while the graph updates.</p>
+        <div class="progress" aria-hidden="true"><i id="load-bar"></i></div>
+        <div class="stats">
+          <div class="stat"><b id="stat-nodes">—</b><span>nodes</span></div>
+          <div class="stat"><b id="stat-edges">—</b><span>edges</span></div>
+          <div class="stat"><b id="stat-seq">0</b><span>seq</span></div>
+        </div>
+      </div>
+
+      <div id="chat-log" aria-live="polite">
+        <div class="bubble system">
+          Loading the complete control-flow graph… Then type an Order id (e.g. <span class="mono">39</span>) to investigate.
+        </div>
+      </div>
+
+      <div class="chat-composer">
+        <div class="toggles">
+          <label><input type="checkbox" id="tog-edges" /> Show all CF edges</label>
+          <label><input type="checkbox" id="tog-labels" /> All labels while highlighting</label>
+        </div>
+        <div class="row" style="margin-bottom:0.4rem">
+          <select id="var-select" disabled>
+            <option value="">Variable (auto from DF)</option>
+          </select>
+          <button id="btn-clear" class="secondary" type="button">Clear graph</button>
+        </div>
+        <div class="row">
+          <input id="chat-input" type="text" placeholder="Order id, e.g. 39 or investigate 1,112" autocomplete="off" />
+          <button id="btn-send" type="button">Send</button>
+        </div>
+        <p class="composer-hint" id="composer-hint">Graph loading…</p>
+      </div>
+    </aside>
+
+    <section id="stage">
+      <div id="network"></div>
+      <div id="tooltip" class="mono"></div>
+      <div id="hud">
+        <button class="secondary" id="btn-fit" type="button">Fit</button>
+        <button class="secondary" id="btn-seq-fit" type="button" disabled>Focus sequence</button>
+      </div>
+    </section>
+
+    <aside class="right" id="right-panel">
+      <div id="right-empty" class="empty-right">
+        Run an investigation to highlight the DF sequence: first access, following read/write steps, and alarms on that path.
+      </div>
+      <div id="right-content" hidden>
+        <h2 id="right-title">Variable sequence</h2>
+        <div id="right-meta" class="sub" style="margin-bottom:0.7rem"></div>
+        <div class="first-card" id="first-card"></div>
+        <div class="mini-stats" id="mini-stats"></div>
+        <h2>Following sequence</h2>
+        <div class="timeline" id="timeline"></div>
+        <div class="alarm-section">
+          <h2>Alarms in this sequence</h2>
+          <div class="alarm-list" id="alarm-list"></div>
+        </div>
+      </div>
+      <div class="legend">
+        <div><i style="background:#38bdf8"></i>Read · <i style="background:#fb923c"></i>Write · <i style="background:#c084fc"></i>Mixed</div>
+        <div><i style="background:#f43f5e"></i>Alarm on sequence · <i style="background:#2a354d"></i>Dimmed CF</div>
+      </div>
+    </aside>
+  </div>
+
+  <script type="module">
+    import Graph from "https://cdn.jsdelivr.net/npm/graphology@0.25.4/+esm";
+    import Sigma from "https://cdn.jsdelivr.net/npm/sigma@3.0.1/+esm";
+    import { getCorrectionRatio } from "https://cdn.jsdelivr.net/npm/sigma@3.0.1/utils/+esm";
+
+    const C = {
+      base: "#5b6b86",
+      dim: "#243047",
+      read: "#38bdf8",
+      write: "#fb923c",
+      mixed: "#c084fc",
+      other: "#94a3b8",
+      bridge: "#64748b",
+      edge: "#2a3854",
+      pathEdge: "#94a3b8",
+      directEdge: "#e2e8f0",
+      label: "#e8edf7",
+      alarm: "#f43f5e",
+    };
+
+    const el = (id) => document.getElementById(id);
+    const setProgress = (p) => { el("load-bar").style.width = `${Math.max(0, Math.min(100, p))}%`; };
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+    const setHint = (msg) => { el("composer-hint").textContent = msg; };
+
+    let graph = null;
+    let renderer = null;
+    let lastHighlight = null;
+    let showAllEdges = false;
+    let alwaysLabels = false;
+    let busy = false;
+    let graphReady = false;
+
+    function accessColor(kind) {
+      if (kind === "read") return C.read;
+      if (kind === "write") return C.write;
+      if (kind === "mixed") return C.mixed;
+      return C.other;
+    }
+
+    function scrollChat() {
+      const log = el("chat-log");
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function appendBubble(html, cls = "system") {
+      const div = document.createElement("div");
+      div.className = `bubble ${cls}`;
+      div.innerHTML = html;
+      el("chat-log").appendChild(div);
+      scrollChat();
+      return div;
+    }
+
+    function parseOrderId(raw) {
+      const text = String(raw || "").trim();
+      const m = text.match(/(\d[\d,]*)/);
+      return m ? m[1] : "";
+    }
+
+    function setNodeBase(id, size) {
+      graph.setNodeAttribute(id, "color", C.base);
+      graph.setNodeAttribute(id, "size", size);
+      graph.setNodeAttribute(id, "label", id);
+      graph.setNodeAttribute(id, "forceLabel", false);
+      graph.setNodeAttribute(id, "zIndex", 0);
+    }
+
+    function showAllNodeLabels() {
+      if (!graph) return;
+      graph.forEachNode((id) => {
+        graph.setNodeAttribute(id, "label", id);
+        graph.setNodeAttribute(id, "forceLabel", false);
+      });
+      renderer?.setSetting("renderLabels", true);
+      renderer?.setSetting("labelRenderedSizeThreshold", 6);
+      renderer?.refresh();
+    }
+
+    function showSequenceLabelsOnly(seqSet) {
+      if (!graph) return;
+      graph.forEachNode((id) => {
+        if (seqSet.has(id)) {
+          graph.setNodeAttribute(id, "forceLabel", true);
+        } else {
+          graph.setNodeAttribute(id, "label", "");
+          graph.setNodeAttribute(id, "forceLabel", false);
+        }
+      });
+      renderer?.setSetting("renderLabels", true);
+      renderer?.setSetting("labelRenderedSizeThreshold", 0);
+      renderer?.refresh();
+    }
+
+    async function loadGraph() {
+      setProgress(8);
+      const t0 = performance.now();
+      const res = await fetch("/api/graph");
+      if (!res.ok) throw new Error(`Graph HTTP ${res.status}`);
+      setProgress(35);
+      const data = await res.json();
+      setProgress(55);
+
+      el("stat-nodes").textContent = data.stats?.nodes ?? data.nodes.length;
+      el("stat-edges").textContent = data.stats?.edges ?? data.edges.length;
+
+      graph = new Graph({ type: "directed", multi: false, allowSelfLoops: true });
+      for (const n of data.nodes) {
+        graph.addNode(n.id, {
+          x: n.x, y: n.y,
+          size: n.s || 2,
+          color: C.base,
+          label: n.id,
+          originalSize: n.s || 2,
+          forceLabel: false,
+          zIndex: 0,
+        });
+      }
+      setProgress(75);
+      for (const e of data.edges) {
+        if (!graph.hasEdge(e.id) && graph.hasNode(e.s) && graph.hasNode(e.t)) {
+          const sz = Math.min(0.6 + Math.log2((e.w || 1) + 1) * 0.35, 2.2);
+          graph.addEdgeWithKey(e.id, e.s, e.t, {
+            size: sz, color: C.edge, hidden: true, originalSize: sz, zIndex: 0,
+          });
+        }
+      }
+      setProgress(88);
+
+      renderer = new Sigma(graph, el("network"), {
+        allowInvalidContainer: true,
+        renderLabels: true,
+        labelFont: "IBM Plex Sans",
+        labelColor: { color: C.label },
+        labelSize: 11,
+        labelWeight: "500",
+        labelRenderedSizeThreshold: 6,
+        defaultEdgeType: "arrow",
+        stagePadding: 40,
+        zIndex: true,
+      });
+
+      const tip = el("tooltip");
+      renderer.on("enterNode", ({ node }) => {
+        const coords = renderer.graphToViewport(graph.getNodeAttributes(node));
+        tip.style.display = "block";
+        tip.style.left = `${coords.x + 14}px`;
+        tip.style.top = `${coords.y + 14}px`;
+        tip.textContent = node;
+      });
+      renderer.on("leaveNode", () => { tip.style.display = "none"; });
+      renderer.on("clickNode", ({ node }) => {
+        navigator.clipboard?.writeText(node).catch(() => {});
+        appendBubble(`Copied node id: <span class="mono">${esc(node)}</span>`, "status");
+      });
+
+      renderer.getCamera().animatedReset({ duration: 0 });
+      showAllNodeLabels();
+      setProgress(100);
+      graphReady = true;
+      setHint("Enter an Order id and press Send · graph + agent stream together");
+      appendBubble(
+        `CF graph ready in ${Math.round(performance.now() - t0)} ms · WebGL. Try <span class="mono">39</span>.`,
+        "status"
+      );
+    }
+
+    function applyEdgeVisibility() {
+      if (!graph) return;
+      const pathEdges = new Set(lastHighlight?.highlight_edge_ids || []);
+      const direct = new Set();
+      (lastHighlight?.segments || []).forEach((s) => {
+        if (s.kind === "direct") (s.edges || []).forEach((id) => direct.add(id));
+      });
+      graph.forEachEdge((id, attrs) => {
+        if (showAllEdges) {
+          graph.setEdgeAttribute(id, "hidden", false);
+          if (pathEdges.has(id)) {
+            graph.setEdgeAttribute(id, "color", direct.has(id) ? C.directEdge : C.pathEdge);
+            graph.setEdgeAttribute(id, "size", (attrs.originalSize || 1) * 2.2);
+            graph.setEdgeAttribute(id, "zIndex", 2);
+          } else if (lastHighlight) {
+            graph.setEdgeAttribute(id, "color", "#152033");
+            graph.setEdgeAttribute(id, "size", 0.25);
+            graph.setEdgeAttribute(id, "zIndex", 0);
+          } else {
+            graph.setEdgeAttribute(id, "color", C.edge);
+            graph.setEdgeAttribute(id, "size", attrs.originalSize || 0.6);
+            graph.setEdgeAttribute(id, "zIndex", 0);
+          }
+          return;
+        }
+        if (lastHighlight && pathEdges.has(id)) {
+          graph.setEdgeAttribute(id, "hidden", false);
+          graph.setEdgeAttribute(id, "color", direct.has(id) ? C.directEdge : C.pathEdge);
+          graph.setEdgeAttribute(id, "size", (attrs.originalSize || 1) * 2.4);
+          graph.setEdgeAttribute(id, "zIndex", 2);
+        } else {
+          graph.setEdgeAttribute(id, "hidden", true);
+        }
+      });
+      renderer?.refresh();
+    }
+
+    function clearRight() {
+      el("right-empty").hidden = false;
+      el("right-content").hidden = true;
+      el("timeline").innerHTML = "";
+      el("alarm-list").innerHTML = "";
+      el("first-card").innerHTML = "";
+      el("mini-stats").innerHTML = "";
+    }
+
+    function renderRight(payload) {
+      el("right-empty").hidden = true;
+      el("right-content").hidden = false;
+
+      const alarm = payload.alarm || {};
+      const counts = payload.counts || {};
+      el("right-title").textContent = payload.variable || "Variable sequence";
+      el("right-meta").textContent =
+        `From Order ${alarm.order ?? "?"} · ${alarm.category || ""} · ${alarm.location || ""}`;
+
+      const first = payload.first_access;
+      if (first) {
+        el("first-card").innerHTML = `
+          <div class="tag">First access</div>
+          <div class="fn mono">${esc(first.function)}</div>
+          <div class="meta">
+            <span class="badge ${esc(first.access_kind)}">${esc(first.access_kind)}</span>
+            &nbsp;·&nbsp; event #${first.order}
+            <div class="mono" style="margin-top:0.3rem">${esc(first.location)}</div>
+            <div>process: ${esc(first.process || "—")}</div>
+          </div>`;
+      } else {
+        el("first-card").innerHTML = `<div class="tag">First access</div><div class="meta">No DF events found</div>`;
+      }
+
+      el("mini-stats").innerHTML = `
+        <div class="chip"><b>${counts.timeline_steps ?? 0}</b> steps</div>
+        <div class="chip"><b style="color:var(--read)">${counts.reads ?? 0}</b> reads</div>
+        <div class="chip"><b style="color:var(--write)">${counts.writes ?? 0}</b> writes</div>
+        <div class="chip"><b style="color:var(--alarm)">${counts.alarms ?? 0}</b> alarms</div>`;
+
+      const timeline = payload.timeline || [];
+      el("timeline").innerHTML = timeline.map((step) => {
+        const hasAlarm = (step.alarms || []).length > 0;
+        const alarmHtml = (step.alarms || []).map((a) => `
+          <div class="alarm-row ${a.order === alarm.order ? "query" : ""}">
+            <b>Alarm ${a.order}</b> · ${esc(a.category || a.type || "Alarm")}
+            <div class="mono">${esc(a.location)}</div>
+          </div>`).join("");
+        return `
+          <div class="tl-item">
+            <div class="tl-rail">
+              <div class="tl-dot ${esc(step.access_kind)}${step.is_first ? " first" : ""}"></div>
+            </div>
+            <div class="tl-body ${hasAlarm ? "has-alarm" : ""}">
+              <div class="tl-top">
+                <span class="tl-step">Step ${step.step}${step.count > 1 ? ` · ×${step.count}` : ""}</span>
+                <span class="badge ${esc(step.access_kind)}">${esc(step.access_kind)}</span>
+              </div>
+              <div class="tl-fn mono">${esc(step.function)}</div>
+              <div class="tl-loc mono">${esc(step.location)}</div>
+              ${hasAlarm ? `<div class="tl-alarms">${alarmHtml}</div>` : ""}
+            </div>
+          </div>`;
+      }).join("") || `<div class="empty-right">No sequence steps</div>`;
+
+      const alarms = payload.alarms_in_sequence || [];
+      el("alarm-list").innerHTML = alarms.length
+        ? alarms.map((a) => `
+          <div class="alarm-row ${a.is_query_alarm ? "query" : ""}">
+            <b>Order ${a.order}${a.is_query_alarm ? " · queried" : ""}</b>
+            <div>${esc(a.category || a.type || "Alarm")}</div>
+            <div class="mono">${esc(a.location)}</div>
+            <div style="margin-top:0.2rem;color:var(--muted)">
+              ${a.at_function ? `at <span class="mono">${esc(a.at_function)}</span>` : "on sequence path"}
+              ${a.at_access ? ` · <span class="badge ${esc(a.at_access)}">${esc(a.at_access)}</span>` : ""}
+              ${a.df_event_order ? ` · DF #${a.df_event_order}` : ""}
+            </div>
+          </div>`).join("")
+        : `<div class="empty-right">No alarms found on this variable’s DF locations.</div>`;
+    }
+
+    function clearHighlight() {
+      lastHighlight = null;
+      el("stat-seq").textContent = "0";
+      el("btn-seq-fit").disabled = true;
+      el("var-select").innerHTML = `<option value="">Variable (auto from DF)</option>`;
+      el("var-select").disabled = true;
+      clearRight();
+      if (!graph) return;
+      graph.forEachNode((id, attrs) => setNodeBase(id, attrs.originalSize || 2));
+      applyEdgeVisibility();
+      showAllNodeLabels();
+      appendBubble("Graph highlight cleared · full CF visible", "status");
+    }
+
+    function cameraToNodes(nodeIds) {
+      if (!renderer || !graph || !nodeIds?.length) return;
+      const ids = [...new Set(nodeIds.filter((id) => graph.hasNode(id)))];
+      if (!ids.length) return;
+
+      // Sigma camera x/y live in *framed* display space (fit ≈ 0.5/0.5, ratio 1),
+      // not raw layout coordinates. Feeding layout x/y zooms into empty space (black).
+      let gMinX = Infinity, gMaxX = -Infinity, gMinY = Infinity, gMaxY = -Infinity;
+      let fMinX = Infinity, fMaxX = -Infinity, fMinY = Infinity, fMaxY = -Infinity;
+      for (const id of ids) {
+        const data = renderer.getNodeDisplayData(id);
+        if (!data) continue;
+        const { x, y } = graph.getNodeAttributes(id);
+        gMinX = Math.min(gMinX, x); gMaxX = Math.max(gMaxX, x);
+        gMinY = Math.min(gMinY, y); gMaxY = Math.max(gMaxY, y);
+        fMinX = Math.min(fMinX, data.x); fMaxX = Math.max(fMaxX, data.x);
+        fMinY = Math.min(fMinY, data.y); fMaxY = Math.max(fMaxY, data.y);
+      }
+      if (!Number.isFinite(fMinX)) return;
+
+      const bbox = renderer.getCustomBBox() || renderer.getBBox();
+      const graphWidth = (bbox.x[1] - bbox.x[0]) || 1;
+      const graphHeight = (bbox.y[1] - bbox.y[0]) || 1;
+      const { width, height } = renderer.getDimensions();
+      const groupWidth = (gMaxX - gMinX) || graphWidth;
+      const groupHeight = (gMaxY - gMinY) || graphHeight;
+      const correction = getCorrectionRatio(
+        { width, height },
+        { width: graphWidth, height: graphHeight }
+      );
+      const ratio =
+        ((groupHeight / groupWidth < height / width ? groupWidth : groupHeight) /
+          Math.max(graphWidth, graphHeight)) *
+        correction;
+
+      const cam = renderer.getCamera();
+      cam.animate(
+        {
+          ...cam.getState(),
+          angle: 0,
+          x: (fMinX + fMaxX) / 2,
+          y: (fMinY + fMaxY) / 2,
+          ratio: Math.max(0.02, Math.min(ratio, 1.5)),
+        },
+        { duration: 450 }
+      );
+    }
+
+    function applyHighlight(payload) {
+      lastHighlight = payload;
+      const seq = payload.function_sequence || [];
+      const bridges = new Set(payload.bridge_nodes || []);
+      const seqSet = new Set(seq);
+      const pathNodes = new Set(payload.highlight_nodes || []);
+      const fnAccess = payload.function_access || {};
+      const alarmFns = new Set(
+        (payload.alarms_in_sequence || []).map((a) => a.at_function).filter(Boolean)
+      );
+
+      el("stat-seq").textContent = String(payload.counts?.timeline_steps ?? seq.length);
+      el("btn-seq-fit").disabled = seq.length === 0;
+
+      graph.forEachNode((id, attrs) => {
+        if (seqSet.has(id)) {
+          const step = seq.indexOf(id) + 1;
+          const kind = fnAccess[id] || "other";
+          const color = accessColor(kind);
+          graph.setNodeAttribute(id, "color", color);
+          graph.setNodeAttribute(id, "size", Math.max(7, (attrs.originalSize || 2) * (alarmFns.has(id) ? 3.1 : 2.7)));
+          graph.setNodeAttribute(id, "label", `${step}. ${id}`);
+          graph.setNodeAttribute(id, "forceLabel", true);
+          graph.setNodeAttribute(id, "zIndex", 3);
+        } else if (bridges.has(id) || pathNodes.has(id)) {
+          graph.setNodeAttribute(id, "color", C.bridge);
+          graph.setNodeAttribute(id, "size", Math.max(5, (attrs.originalSize || 2) * 1.7));
+          graph.setNodeAttribute(id, "label", alwaysLabels ? id : "");
+          graph.setNodeAttribute(id, "forceLabel", !!alwaysLabels);
+          graph.setNodeAttribute(id, "zIndex", 2);
+        } else {
+          graph.setNodeAttribute(id, "color", C.dim);
+          graph.setNodeAttribute(id, "size", Math.max(1, (attrs.originalSize || 2) * 0.55));
+          graph.setNodeAttribute(id, "label", alwaysLabels ? id : "");
+          graph.setNodeAttribute(id, "forceLabel", false);
+          graph.setNodeAttribute(id, "zIndex", 0);
+        }
+      });
+
+      applyEdgeVisibility();
+      if (alwaysLabels) {
+        showAllNodeLabels();
+        seq.forEach((id, i) => {
+          if (graph.hasNode(id)) {
+            graph.setNodeAttribute(id, "label", `${i + 1}. ${id}`);
+            graph.setNodeAttribute(id, "forceLabel", true);
+          }
+        });
+        renderer.refresh();
+      } else {
+        showSequenceLabelsOnly(seqSet);
+      }
+      cameraToNodes(seq);
+      renderRight(payload);
+
+      const vars = payload.site_variables || [];
+      const sel = el("var-select");
+      sel.innerHTML = (vars.length ? vars : [payload.variable]).filter(Boolean).map((v) =>
+        `<option value="${esc(v)}" ${v === payload.variable ? "selected" : ""}>${esc(v)}</option>`
+      ).join("") || `<option value="">Variable (auto)</option>`;
+      sel.disabled = vars.length <= 1;
+    }
+
+    async function runHighlight(orderId, variableOverride = null) {
+      const res = await fetch("/api/highlight", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          order_id: orderId,
+          variable: variableOverride || el("var-select").value || null,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        throw new Error(data.error || data.detail || "Highlight failed");
+      }
+      applyHighlight(data);
+      return data;
+    }
+
+    function renderReport(data) {
+      const be = data.bounds_evidence || {};
+      const symbols = (data.affected_symbols || [])
+        .map((s) => (typeof s === "string" ? s : s.name))
+        .filter(Boolean)
+        .join(", ");
+      const tools = (data.tools_used || []).join(", ");
+      const cls = String(data.classification ?? "").toLowerCase();
+      const clsLabel = cls === "true"
+        ? "true (real bug)"
+        : cls === "false"
+          ? "false (false positive)"
+          : (data.classification || "—");
+      return `
+        <div class="tag">Investigation report</div>
+        <div class="report-grid">
+          <dt>Order</dt><dd class="mono">${esc(data.alarm_order_id)}</dd>
+          <dt>Astrée message</dt><dd class="mono">${esc(data.astree_message || "—")}</dd>
+          <dt>Classification (agent)</dt><dd>${esc(clsLabel)}</dd>
+          <dt>Comment (agent)</dt><dd>${esc(data.comment || "—")}</dd>
+          <dt>Confidence</dt><dd>${esc(data.confidence ?? "—")}</dd>
+          <dt>Category</dt><dd>${esc(data.alarm_category || data.alarm_type || "—")}</dd>
+          <dt>Summary</dt><dd>${esc(data.summary || "—")}</dd>
+          <dt>Evidence completeness</dt><dd>${esc(be.evidence_completeness || "—")}</dd>
+          <dt>Symbols</dt><dd class="mono">${esc(symbols || "—")}</dd>
+          <dt>Tools used</dt><dd class="mono">${esc(tools || "—")}</dd>
+        </div>
+        <details style="margin-top:0.45rem">
+          <summary style="cursor:pointer;color:var(--muted);font-size:0.75rem">Full JSON</summary>
+          <pre class="mono">${esc(JSON.stringify(data, null, 2))}</pre>
+        </details>`;
+    }
+
+    function handleStreamEvent(ev) {
+      switch (ev.type) {
+        case "status":
+          // Keep a single live heartbeat bubble instead of spamming the log.
+          if (String(ev.message || "").startsWith("Still waiting on the NVIDIA")) {
+            let hb = el("chat-log").querySelector(".bubble.heartbeat");
+            if (!hb) {
+              hb = appendBubble(esc(ev.message), "status");
+              hb.classList.add("heartbeat");
+            } else {
+              hb.textContent = ev.message;
+              scrollChat();
+            }
+          } else {
+            appendBubble(esc(ev.message), "status");
+          }
+          break;
+        case "tool_call":
+          appendBubble(
+            `<div class="tag">Tool call · ${esc(ev.name)}</div>
+             <pre class="mono">${esc(JSON.stringify(ev.args || {}, null, 2))}</pre>`,
+            "tool-call"
+          );
+          break;
+        case "tool_result":
+          appendBubble(
+            `<div class="tag">Tool result · ${esc(ev.name)}</div>
+             <pre class="mono">${esc(ev.preview || "")}</pre>`,
+            "tool-result"
+          );
+          break;
+        case "agent":
+          appendBubble(
+            `<div class="tag">Reasoning</div>${esc(ev.content)}`,
+            "agent"
+          );
+          break;
+        case "report":
+          appendBubble(renderReport(ev.data || {}), "report");
+          break;
+        case "error":
+          appendBubble(`<strong>Error</strong> · ${esc(ev.message)}`, "error");
+          break;
+        case "done":
+          appendBubble(`Investigation complete for Order <span class="mono">${esc(ev.order_id)}</span>.`, "status");
+          break;
+        default:
+          appendBubble(`<pre class="mono">${esc(JSON.stringify(ev))}</pre>`, "system");
+      }
+    }
+
+    async function streamInvestigate(orderId) {
+      const res = await fetch("/api/investigate/stream", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+        body: JSON.stringify({ order_id: orderId }),
+      });
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`;
+        try {
+          const j = await res.json();
+          detail = j.detail || detail;
+        } catch (_) { /* ignore */ }
+        throw new Error(detail);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split("\n\n");
+        buffer = chunks.pop() || "";
+        for (const chunk of chunks) {
+          const line = chunk.split("\n").find((l) => l.startsWith("data: "));
+          if (!line) continue;
+          try {
+            handleStreamEvent(JSON.parse(line.slice(6)));
+          } catch (err) {
+            appendBubble(`Bad stream event: ${esc(String(err))}`, "error");
+          }
+        }
+      }
+    }
+
+    async function sendChat() {
+      if (busy) return;
+      if (!graphReady) {
+        appendBubble("Wait for the graph to finish loading.", "error");
+        return;
+      }
+      const raw = el("chat-input").value.trim();
+      const orderId = parseOrderId(raw);
+      if (!orderId) {
+        appendBubble("Enter an alarm Order id (digits, optional commas).", "error");
+        return;
+      }
+      busy = true;
+      el("btn-send").disabled = true;
+      el("chat-input").value = "";
+      appendBubble(`Investigate Order <span class="mono">${esc(orderId)}</span>`, "user");
+      setHint(`Investigating Order ${orderId}…`);
+
+      const highlightPromise = runHighlight(orderId)
+        .then((data) => {
+          appendBubble(
+            `Graph highlighted · ${data.counts?.timeline_steps ?? 0} DF steps · ${data.counts?.alarms ?? 0} alarms on path`,
+            "status"
+          );
+        })
+        .catch((err) => {
+          appendBubble(`Highlight: ${esc(String(err))}`, "error");
+        });
+
+      try {
+        await streamInvestigate(orderId);
+        await highlightPromise;
+        setHint("Enter another Order id to continue");
+      } catch (err) {
+        appendBubble(esc(String(err)), "error");
+        setHint("Investigation failed — try again");
+      } finally {
+        busy = false;
+        el("btn-send").disabled = false;
+        el("chat-input").focus();
+      }
+    }
+
+    el("btn-send").addEventListener("click", sendChat);
+    el("chat-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendChat();
+      }
+    });
+    el("btn-clear").addEventListener("click", clearHighlight);
+    el("var-select").addEventListener("change", () => {
+      if (!el("var-select").value || !lastHighlight?.alarm?.order) return;
+      runHighlight(String(lastHighlight.alarm.order), el("var-select").value).catch((err) => {
+        appendBubble(esc(String(err)), "error");
+      });
+    });
+    el("tog-edges").addEventListener("change", (e) => {
+      showAllEdges = e.target.checked;
+      applyEdgeVisibility();
+    });
+    el("tog-labels").addEventListener("change", (e) => {
+      alwaysLabels = e.target.checked;
+      if (!lastHighlight) {
+        showAllNodeLabels();
+        return;
+      }
+      applyHighlight(lastHighlight);
+    });
+    el("btn-fit").addEventListener("click", () => renderer?.getCamera().animatedReset({ duration: 400 }));
+    el("btn-seq-fit").addEventListener("click", () => cameraToNodes(lastHighlight?.function_sequence || []));
+
+    loadGraph().catch((err) => {
+      setProgress(0);
+      setHint("Graph failed to load");
+      appendBubble(esc(String(err)), "error");
+    });
+  </script>
+</body>
+</html>
