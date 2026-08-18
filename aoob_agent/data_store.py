@@ -933,7 +933,10 @@ class DataStore:
                     )
 
                 # Closing: } TypeName;
-                cm = re.match(r"^\}\s*([A-Za-z_]\w*)\s*;\s*$", text)
+                cm = re.match(
+                    r"^\}\s*([A-Za-z_]\w*)(?:\s*,\s*\*?[A-Za-z_]\w*)*\s*;\s*$",
+                    text,
+                )
                 if cm:
                     type_name = cm.group(1)
                     for fname, size, left, fln, raw in pending_fields:
@@ -977,7 +980,8 @@ class DataStore:
             # Object definition: TypeName VarName;
             om = re.match(
                 r"^(?:static\s+|extern\s+|const\s+|volatile\s+)*"
-                r"([A-Za-z_]\w*)\s+([A-Za-z_]\w*)\s*;\s*$",
+                r"(?:struct\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)"
+                r"\s*(?:=\s*[^;]+)?;\s*$",
                 text,
             )
             if om:
@@ -1051,6 +1055,50 @@ class DataStore:
                 if name.startswith(key + ".") and drec.array_size is not None:
                     if not any(f.name == name or f.name.endswith("." + name.split(".")[-1]) for f in fields):
                         fields.append(drec)
+            # Fallback: if typedef array members were not indexed, infer member
+            # candidates from declaration/data-flow keys (e.g. obj.raw).
+            if not fields:
+                seen_member: set[str] = set()
+                for name in self.declarations:
+                    if not name.startswith(key + "."):
+                        continue
+                    member = name.split(".", 1)[1]
+                    if not member or member in seen_member:
+                        continue
+                    seen_member.add(member)
+                    drec = self.declarations[name]
+                    fields.append(
+                        DeclarationRecord(
+                            name=name,
+                            raw_declaration_text=drec.raw_declaration_text,
+                            array_size=drec.array_size,
+                            declared_type=drec.declared_type,
+                            is_pointer=drec.is_pointer,
+                            location=drec.location,
+                            parse_note=drec.parse_note,
+                        )
+                    )
+                for df_name in self.data_flow_by_variable:
+                    if not df_name.startswith(key + "."):
+                        continue
+                    member = df_name.split(".", 1)[1].split("@", 1)[0].strip('"')
+                    if not member or member in seen_member:
+                        continue
+                    seen_member.add(member)
+                    fields.append(
+                        DeclarationRecord(
+                            name=f"{key}.{member}",
+                            raw_declaration_text="",
+                            array_size=None,
+                            declared_type="unknown",
+                            is_pointer=False,
+                            location="",
+                            parse_note=(
+                                "Member inferred from data-flow keys; declaration "
+                                "line not resolved."
+                            ),
+                        )
+                    )
             return {
                 "symbol": key,
                 "found": True,

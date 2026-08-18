@@ -16,7 +16,13 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from aoob_agent.agent import llm_backend_label, stream_investigate, using_ollama
+from aoob_agent.agent import (
+    llm_backend_label,
+    planner_backend_label,
+    report_backend_label,
+    stream_investigate,
+    using_ollama,
+)
 from aoob_agent.data_store import DataStore
 from cf_viz.export import build_and_export_full_graph, load_graph_payload
 from cf_viz.graph_builder import build_control_flow_graph
@@ -91,7 +97,8 @@ async def lifespan(app: FastAPI):
     local = using_ollama()
     print(
         f"[cf_viz] Ready — nodes={stats.get('nodes')} edges={stats.get('edges')} "
-        f"alarms={len(store.alarms)} llm={llm_backend_label()} "
+        f"alarms={len(store.alarms)} planner={planner_backend_label()} "
+        f"report={report_backend_label()} "
         f"nvidia_key={'yes' if has_key else 'NO'} ollama={'yes' if local else 'NO'}",
         flush=True,
     )
@@ -121,6 +128,8 @@ def health() -> dict[str, Any]:
         "nvidia_configured": bool(os.getenv("NVIDIA_API_KEY")),
         "ollama_configured": using_ollama(),
         "llm_backend": llm_backend_label(),
+        "llm_backend_planner": planner_backend_label(),
+        "llm_backend_report": report_backend_label(),
     }
 
 
@@ -198,7 +207,7 @@ async def investigate_stream(req: InvestigateRequest) -> StreamingResponse:
             except asyncio.TimeoutError:
                 idle_rounds += 1
                 msg = (
-                    f"Still waiting on {llm_backend_label()}… "
+                    f"Still waiting on {planner_backend_label()}… "
                     f"({idle_rounds * 12}s). First tool-call can take 1–3 minutes."
                 )
                 yield f"data: {json.dumps({'type': 'status', 'message': msg})}\n\n"

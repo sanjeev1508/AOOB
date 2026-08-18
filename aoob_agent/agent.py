@@ -8,6 +8,10 @@ import re
 import sys
 from pathlib import Path
 from typing import Annotated, Any, Literal, Optional, TypedDict
+from uuid import uuid4
+from urllib.parse import urlparse
+from urllib.error import URLError
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -18,7 +22,7 @@ from langgraph.prebuilt import ToolNode
 
 from aoob_agent.data_store import DataStore
 from aoob_agent.report import AlarmInvestigationReport
-from aoob_agent.tools import TOOLS, bind_store, extract_index_operands
+from aoob_agent.tools import TOOLS, bind_store
 
 DEFAULT_NVIDIA_MODEL = "meta/llama-3.1-70b-instruct"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
@@ -26,301 +30,108 @@ DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 # Soft ceiling so multi-tool investigations (decl + index slice + guards + …) can finish.
 _MAX_TOOL_MESSAGES = 12
 
-# Index-origin retrieval tools — process gate only (never forces true/false).
-_ORIGIN_TOOLS = frozenset(
-    {
-        "get_backward_slice",
-        "get_variable_manipulation_sequence",
-        "get_all_writes_to_symbol",
-        "get_call_site_arguments",
-    }
-)
+# Index-origin retrieval tools — process gates only (never forces true/false).
+_ORIGIN_TOOLS = frozenset({"get_trimmed_sequence", "get_caller_context"})
 
-INDEX_ORIGIN_NUDGE = """You have not yet traced a real INDEX operand.
+INDEX_ORIGIN_NUDGE = """You have not yet gathered enough index-origin evidence.
 
 Required next step (retrieval only — not a verdict):
-- Read index_operand_candidates from the latest get_affected_symbols result.
-- Call get_backward_slice (preferred) on ONE of those candidates (e.g. checkword,
-  Struct.Field, idxMRPChnl_u16) — NOT indexed_objects (the array), NOT sentinel
-  pointers, NOT the table name.
-- Prefer get_declaration_bounds on indexed_objects (e.g. Obj.raw) for the bound.
-- For Struct.Field indexes, pass the qualified name or the field; if the slice is
-  empty, call get_all_writes_to_symbol on the same name.
-- If the alarm snippet shows shifts/masks on the index, call
-  get_index_expression_structure on that expression before treating Astrée [lo,hi]
-  as the final index range.
-- Do NOT finalize yet. Do NOT argue array_size < Astrée abstract hi as proof of
-  classification "true".
-- After a correct index slice returns, you may continue or finish; classification
-  remains yours.
+- Call get_function_snippet and read index_operands_at_alarm.
+- Trace that operand symbol using get_trimmed_sequence(variable=<operand>). Do not
+    treat tracing the indexed array symbol as index-origin completion.
+- If get_trimmed_sequence returns origin_resolved=true, do not hop callers.
+- If origin_resolved=false and scope is parameter, call get_caller_context(parameter=<operand>). 
+- Do not finalize from Astrée interval text alone.
 """
 
-CALL_SITE_NUDGE = """Index looks like a function PARAMETER (empty local writes).
+CALLER_NUDGE = """The trace still requires caller-side evidence.
 
 Required next step (retrieval only — not a verdict):
-- Read call_site_arguments / next_slice_candidates from the latest
-  get_backward_slice (or call get_call_site_arguments on the enclosing function +
-  parameter name).
-- Call get_backward_slice on ONE argument identifier from next_slice_candidates
-  (the expression callers actually pass), NOT the parameter name again.
-- Also call get_condition_guards on that argument identifier at a caller
-  call_site location when available.
-- If parameter_type_width.abstract_max matches Astrée's index hi (e.g. 255 for
-  uint8), treat that as type-domain over-approx unless call-site evidence shows a
-  concrete oversized value can reach the access.
-- Do NOT finalize as classification "true" / medium from Astrée hi vs array_size
-  alone while call-site arguments remain unexamined.
+- Call get_caller_context (pass parameter name when tracing a parameter index).
+- Then call get_trimmed_sequence on the same parameter/operand symbol.
+- Continue until caller_context reports unresolved=true or origin_resolved becomes true.
 """
 
-GUARD_NUDGE = """Before finishing an OOB investigation, retrieve condition guards.
+NEXT_HOP_NUDGE = """A caller hop target is open and has not been investigated yet.
 
 Required next step (retrieval only — not a verdict):
-- Call get_condition_guards on the INDEX operand you are tracing (prefer a
-  call-site argument identifier if the index is a parameter) at the alarm or
-  call-site location. This covers if / for / while / switch / assert.
-- If guards name sentinels or limits, call resolve_symbolic_constant on them.
-- Do NOT claim "value is not checked" if a guard already appears in the snippet
-  or in get_condition_guards output — acknowledge it.
-- Then you may finalize; classification remains yours.
+- Call get_trimmed_sequence for the same traced operand symbol after the caller hop.
+- If origin_resolved remains false, call get_caller_context again.
 """
 
-NEXT_HOP_NUDGE = """The last origin tool named a specific identifier as the next value to retrieve.
+SYSTEM_PROMPT = """You are an Astrée out-of-bounds (AOOB) investigation agent.
 
-Required next step (retrieval only — not a verdict):
-- Call get_backward_slice (preferred) or get_all_writes_to_symbol / get_condition_guards
-  on THAT identifier — the one named in assigned_expression_text or
-  next_slice_candidates — not a different symbol.
-- If the tool returns found=false, empty df_keys_matched, or a parse_note that the
-  name is a macro / missing DF row / unresolved, stop retrying that name.
-- Do NOT finalize while that identifier is still open and not explicitly unresolvable.
+You must use retrieval tools only. Never invent sources, declarations, writes,
+or caller relationships. There are no hardcoded verdict rules in Python: you
+author classification/comment/confidence from tool facts.
+
+Planner-turn discipline (STRICT):
+- Stay on AOOB investigation only. Never provide generic software/module
+    explanations, AUTOSAR overviews, architecture summaries, or tutorial text.
+- If a tool is needed, emit tool calls only.
+- If no additional tool is needed for this turn, emit exactly this JSON and
+    nothing else: {"type":"no_tool_call"}
+- Do not output markdown tables/lists unrelated to bounds analysis.
+
+Available tools (retrieval-only):
+1) get_variable_scope(symbol, alarm_order_id?)
+    - Returns local/global/parameter/dynamic_heap/unknown scope facts.
+2) get_declaration_info(symbol)
+     - Returns declared type/kind/array_size/is_pointer/location/parse_note.
+3) get_trimmed_sequence(alarm_order_id?, variable?)
+    - Cross-function data-flow ordered sequence (shared with cf_viz panel).
+    - Hard filter mode: keep write/mixed steps plus the queried alarm step.
+    - Returns origin_resolved=true when the first step is already alarm-site
+      write/mixed (self-contained origin at site).
+4) get_function_snippet(alarm_order_id?, context_lines?)
+    - Returns snippet for current trace function context and index_operands_at_alarm.
+5) get_caller_context(parameter, alarm_order_id?, current_function?)
+     - One-hop callers and optional argument expression text; unresolved=true when
+         no caller edge is available.
+
+Navigation strategy:
+1. Call get_function_snippet and read index_operands_at_alarm.
+2. Select the index operand symbol from that list and trace that operand, not
+   the indexed array symbol.
+3. Call get_variable_scope + get_declaration_info for the traced operand.
+4. Call get_trimmed_sequence for that operand.
+5. If origin_resolved=true, the index-origin gate is satisfied.
+6. If origin_resolved=false and scope=parameter, call get_caller_context,
+   then get_trimmed_sequence again on the same operand.
+7. If origin_resolved=false and scope is local/global, do not caller-hop; keep
+   tracing with available DF evidence or report limitation.
+8. Classify based on evidence.
+
+Critical epistemic guidance:
+- Astrée [lo, hi] is abstract-domain information, not a concrete runtime value.
+- Forbidden rationale: "array_size < Astrée hi => true bug".
+- Index arithmetic rule: if in-code guards constrain the index into the legal
+    safe range (for example if (idx < N)) or tracing resolves to a concrete value
+    within capacity, classify optimistically as false (an analyzer false positive).
+- For complex expressions (a+b, pointer offsets, struct members), reason with
+    explicit bounds math and show index_expression, inferred range, and safe range.
+- Missing allocation/capacity/guard context (especially dynamic pointers) must
+    fallback to review with medium confidence and explicitly list missing evidence
+    in bounds_evidence.index_origin_summary.
+- Incomplete origin tracing should stay review/low confidence.
+
+Trade-off to remember:
+- This 5-tool set intentionally has no dedicated guard/constant/index-structure
+    tools. Read guard/sentinel/shift evidence directly from function snippets
+    instead of assuming a separate tool will return them.
 """
 
-SYSTEM_PROMPT = """You are an Astrée out-of-bounds (AOOB) alarm investigation agent.
+REPORT_PROMPT = """Using ONLY provided tool outputs, produce final report JSON.
 
-You receive an alarm Order id. You MUST use your tools to gather evidence — do not
-invent source locations, variables, declarations, or value origins. There are no
-hardcoded triage rules in code: YOU decide tools, arguments, interpretation,
-classification (true / false / review), comment, and confidence from evidence alone.
+No prose wrappers. No markdown. Return one JSON object matching schema.
 
-Available tools (retrieval-only — they never classify bug/no-bug):
-1) get_affected_symbols — alarm metadata + DF + source at the site.
-   alarm.message (when present) is Astrée's diagnostic text, e.g.
-   "[0, 7] not included in array index range [0, 1]". That is NOT a human label
-   and NOT a concrete runtime index value (see "Abstract intervals" below).
-   Use indexed_objects for declaration lookups; index_operand_candidates for slices.
-2) get_function_snippet — enclosing function + CF edges
-3) get_variable_manipulation_sequence — ordered DF read/write events
-4) get_declaration_bounds — declaration / literal array_size / parse_note /
-   nested_array_fields for union/struct objects. Prefer indexed_objects names
-   (e.g. Obj.raw) when the access is Obj.raw[i].
-5) get_backward_slice — earlier writes + CF callers for ONE symbol at a location.
-   Pass the INDEX / pointer operand. If parameter_note / call_site_arguments
-   appear, the index origin is at callers — follow next_slice_candidates.
-6) get_call_site_arguments — caller argument expressions for a callee parameter
-   (use when the index is a parameter with no local writes).
-7) get_condition_guards — if/switch/assert/ternary text mentioning a variable
-   before the access (and in callers). Raw conditions only — you judge relevance.
-8) resolve_symbolic_constant — literal value of an enum member / #define when
-   resolvable. Prefer this over inferring meaning from the identifier spelling.
-9) get_index_expression_structure — parse shifts/masks/arithmetic/fields in an
-   index expression (structure only; no range evaluation).
-10) get_all_writes_to_symbol — flat exhaustive DF write listing (cross-check when
-   a backward slice is truncated). Reachability still needs slice/CF reasoning.
-
-Abstract intervals (critical):
-- Astrée messages like "[lo, hi] not included in [a, b]" report ABSTRACT DOMAIN
-  bounds (over-approximations), not proof that the index equals hi at runtime.
-- Never argue "array size is N which is less than hi, therefore true bug" from
-  the message alone. hi is an analyzer upper bound, not a measured index.
-- Always separate: (A) declared object size, (B) what concrete/source evidence
-  says about the index/pointer origin, (C) what Astrée's abstract interval says.
-  Classification must weigh all three; (C) alone is insufficient for "true".
-- Type-domain pattern: if the index parameter's type width max equals Astrée hi
-  (e.g. uint8 / uint8_least → 255) and the array is much smaller, that mismatch
-  is a common over-approx shape unless call-site evidence shows a value ≥
-  array size can actually reach the access. That pattern is classification
-  "review" (or "false" only if tools also show a bound/guard/transform that
-  keeps the access inside the object). Never "true" at medium/high on this
-  pattern alone.
-
-Index-expression arithmetic (critical):
-- Before comparing an Astrée [lo, hi] to an array bound, inspect the actual index
-  expression in the snippet. Shifts, masks, offsets, casts, and field extracts
-  change the effective index range.
-- Astrée's [lo, hi] often describes an operand (or abstract field), not necessarily
-  the final subscript after transforms. Example: if the access is
-  ``arr[(idDFC.id) >> 4u]``, do NOT treat a raw [0, 255] on id as proof that the
-  subscript can be 255 — call get_index_expression_structure and APPLY the
-  arithmetic: a right-shift by N shrinks an unsigned operand's max by about 2^N
-  (e.g. 8-bit value >> 4 ⇒ at most 15). Compare the *transformed* range to the
-  bound before concluding "true".
-- Mention the transform explicitly in comment / index_origin_summary when present.
-
-Loop-exit / loop-counter intervals:
-- Astrée intervals for loop counters often include the loop-*exit* value (the
-  bound that fails the loop test), even when the array access sits inside the
-  loop body and never executes at that value.
-- Example pattern: counter runs while ``i < N`` / ``i < numBlocks`` with access
-  ``arr[i]`` and Astrée reports ``[0, N]`` vs declared ``[0, N-1]``. That alone
-  is NOT proof of a reachable OOB — call get_condition_guards (for/while/if) and
-  reason whether the access is protected by the loop/guard condition.
-- Prefer classification "review" (not "false") when the only alarming signal
-  is a one-past-end loop-exit interval, unless a loop/index guard in the tools
-  clearly keeps the access inside the object ("false") or a reachable OOB is
-  shown ("true").
-
-Sentinel / invalid constants:
-- A write that initializes a variable to a named "invalid" / "idle" / default
-  constant is NOT by itself evidence of a real OOB bug.
-- ALWAYS call get_condition_guards on the index before concluding the access is
-  unbounded / classification "true". Resolve named constants with
-  resolve_symbolic_constant — do not rely on identifier spelling alone.
-- If you cannot find a guard and cannot otherwise show the sentinel is reachable
-  as an index at the access, do not exceed confidence "low".
-
-Parameter / call-site navigation (critical):
-- Empty writes_found on a parameter is EXPECTED. Do not treat it as "unchecked
-  unbounded index".
-- When call_site_arguments / next_slice_candidates are present, you MUST attempt
-  at least one slice (or all-writes) on a caller argument identifier before
-  finishing — that is the real index origin path.
-- Call-site expressions like ``startIdx + BufIdx`` / config table lookups are
-  evidence of a constrained constructed index; without a concrete oversized
-  index; without a concrete oversized write, prefer classification "review"
-  (not "true"). Use "false" only if tools also show a bound, guard, or
-  transform that keeps the constructed index inside the object.
-
-Unresolved evidence:
-- If evidence_completeness is "not traced", confidence MUST be "low". Do NOT use
-  medium/high.
-- Do NOT invent a strong "true" from the Astrée string alone.
-- Do NOT invent a strong "false" that invents facts not in tools.
-- Incomplete origin (not traced / parameter with no call-site follow-up) is
-  classification "review", not a false-positive finding.
-- You MAY classify "false" only when tools show the access is actually
-  constrained (guard, in-range init that is the value used, shift/mask that
-  fits, constructed index inside the object).
-- A traced safe-looking initializer (e.g. init=0) plus leftover Astrée
-  type-max [0, 255] is still "review" unless a guard/transform proves the
-  access cannot exceed the bound. Do not use "false" as a safe harbor.
-- classification "true" at medium/high only when tool evidence shows a
-  reachable too-large index/pointer, not the abstract interval alone.
-
-Investigation discipline:
-- For OOB array/pointer alarms, gather BOTH container bounds AND index/pointer
-  origin. Prefer get_declaration_bounds on indexed_objects AND get_backward_slice
-  on index_operand_candidates (then call-site args if parameter).
-- When the snippet shows a non-trivial index expression, call
-  get_index_expression_structure and use the arithmetic consequence.
-- Before classification "true", call get_condition_guards on the index (and
-  resolve_symbolic_constant on any named limits/sentinels in those guards).
-  If a guard is already visible in the function snippet, you MUST acknowledge it
-  in the comment — never claim "value is not checked" when an if/for/while
-  check is in the tool output.
-- Do not stop after message + declaration only. If you have not attempted an
-  index-origin tool, keep going unless you can state a concrete reason that
-  further tools cannot help.
-- When a slice shows a local initializer (e.g. checkword = 0), prior sanitizing
-  writes, or only unresolved/truncated paths, say so explicitly.
-- Slicing the array name itself often yields empty writes_found for const
-  tables; that is not evidence about the index. Re-slice the index symbol /
-  Struct.Field.
-- If get_backward_slice is truncated or empty for a field, use
-  get_all_writes_to_symbol as a cross-check.
-- declared_size null / missing / suppressed 0 means unresolved size — NOT proof
-  the object has zero extent. Never argue "size 0 ⇒ true OOB".
-
-Classification & confidence (you author these; tools/CSV never supply them):
-- classification "true" = a real reachable OOB bug, supported by tool facts
-  beyond Astrée [lo, hi] vs declared size.
-- classification "false" = a false positive: tools show the access is bounded
-  or the alarming interval cannot reach the site (guard, transform, constrained
-  origin). Incomplete evidence is NOT "false".
-- classification "review" = you cannot tell reachable OOB from analyzer FP.
-  Use this when origin is untraced/partial, call sites were not followed, OR
-  origin is traced but the leftover Astrée interval is still unexplained
-  (init=0 + [0,255] type-max is this case — do not dump it to "false").
-- Never write a comment of the form "array size N is less than Astrée hi" as
-  proof of classification "true". That comparison misreads abstract domains.
-- Prefer strong "true" (medium/high) only when evidence beyond the bare Astrée
-  string supports that a too-large index/pointer can actually arise.
-- confidence "high" only when index/pointer origin is meaningfully traced AND
-  consistent with your classification. If evidence_completeness is
-  "not traced", classification should be "review" and confidence "low".
-  If "partially traced", prefer "review" or low/medium — not a confident false.
-- evidence_completeness "fully traced" only if you actually followed the
-  index/pointer to a coherent origin story from tool outputs — not merely
-  because you called three tools. Parameter with only empty local writes =
-  "not traced" or "partially traced" (if call-site args were examined).
-
-Report fields: include classification, comment, astree_message (copy
-alarm.message), bounds_evidence.index_origin_summary, confidence, tools_used.
-
-Do NOT paste a finished JSON report in ordinary assistant turns. Keep using
-tools until done; the dedicated report step builds the structured object.
-"""
-
-REPORT_PROMPT = """Based ONLY on the tool results provided, produce the final
-investigation report. Do not invent facts not present in tool outputs.
-Keep function_snippet to the alarm neighborhood.
-
-Return a single JSON object matching the schema — no prose wrappers, no
-markdown, no `field = value` lines.
-
-Astrée alarm.message intervals are ABSTRACT over-approximations. Do not treat
-the upper bound as a concrete index when writing classification/comment.
-Forbidden rationale: "array_size < Astrée hi ⇒ true bug".
-If a backward slice shows a concrete initializer or constrained writes that
-conflict with reading the abstract hi as a runtime index, reflect that in
-classification/comment/confidence.
-
-Index transforms: if tools show shifts/masks/offsets on the index operand,
-your comment must account for them — apply the arithmetic (>> N shrinks max)
-and do not compare the raw Astrée operand interval to the array bound as if no
-transform existed.
-
-Loop guards: if the index is a loop counter and Astrée's hi equals the loop
-limit / array size, check get_condition_guards / snippet for the loop test —
-do not treat the exit value as a value that reaches an in-loop access.
-
-Parameters: empty local writes + call_site_arguments showing constructed indices
-(config start + buffer id, etc.) without an oversized concrete value ⇒
-classification "review", not "true". "false" only if a bound/guard/transform
-is in the tools. If parameter_type_width.abstract_max equals Astrée hi,
-that is type-domain over-approx — not proof of true, and not by itself proof
-of false.
-
-Sentinels: if tools show a named invalid/default constant write, do not treat
-that alone as proof of "true". Cite guards (or their absence) and any resolved
-constant value. Call get_condition_guards before "true".
-
-Unresolved: if evidence_completeness is "not traced", classification MUST be
-"review" and confidence "low". Do not use "false" as a default when the only
-signal is Astrée abstract vs declared size. A traced init=0 with leftover
-[0, type_max] is "review" unless a guard proves the access stays in-bound.
-
-If evidence_completeness is "fully traced" and tools already returned a
-declaration bound, a condition guard, or an index transform (shift/mask/offset),
-classification must be "true" or "false" — not "review". Unfamiliar helper
-names are not a reason to hedge past that evidence.
-
-Never treat declared_size 0 / null as proof of OOB.
-
-Required agent-authored fields:
-- classification: "true" (real bug), "false" (false positive), or "review"
-  (cannot tell). Incomplete evidence is "review", not "false".
-- comment: short rationale that cites tool facts (not the Astrée string alone).
-- astree_message: copy alarm.message from tools when present.
-- confidence: "low" | "medium" | "high" — calibrate to how well index origin
-  was traced and how consistent that origin is with your classification.
-- bounds_evidence.evidence_completeness: "fully traced" | "partially traced" |
-  "not traced" — "fully traced" only if index/pointer origin was actually
-  reconstructed from tools.
-- bounds_evidence.index_origin_summary: what tools showed about the index
-  (including "not traced" / unresolved / local init = 0 / shifts / guards /
-  call-site argument expressions).
-
-List every tool you relied on in tools_used.
+Rules:
+- Astrée alarm.message intervals are abstract over-approximations.
+- Do not treat abstract hi as concrete index value.
+- Do not claim true bug from array_size vs Astrée hi alone.
+- If bounds context is missing (for example dynamic pointer allocation unknown),
+  prefer classification=review with medium confidence and explicit missing evidence.
+- tools_used must list only tools actually called.
 """
 
 
@@ -334,15 +145,176 @@ class AgentState(TypedDict):
     guard_nudges: int
     next_hop_nudges: int
     force_retries: int
+    consecutive_no_tool_calls: int
 
 
 def load_env(project_root: Path) -> None:
     load_dotenv(project_root / ".env", override=False)
 
 
+def llm_choice_mode() -> Optional[str]:
+    """AOOB_LLM_CHOOSED/AOOB_LLM_CHOOSE=local|network|nvidia selects preferred source."""
+    raw = (
+        os.getenv("AOOB_LLM_CHOOSED")
+        or os.getenv("AOOB_LLM_CHOOSE")
+        or os.getenv("CHOOSED")
+        or ""
+    ).strip().lower()
+    return raw if raw in {"local", "network", "nvidia"} else None
+
+
+def _local_ollama_model_name() -> str:
+    return (
+        os.getenv("OLLAMA_LOCAL")
+        or os.getenv("OLLAMA_LOCAL_MODEL")
+        or os.getenv("OLLAMA_LOCAL_PATH")
+        or ""
+    ).strip()
+
+
+def _network_ollama_model_name() -> str:
+    return (os.getenv("OLLAMA_NETWORK_MODEL") or "").strip()
+
+
+def ollama_base_url(mode: Optional[str] = None) -> str:
+    selected = mode or llm_choice_mode()
+    if selected == "local":
+        return (
+            os.getenv("OLLAMA_LOCAL_HOST")
+            or os.getenv("OLLAMA_LOCAL_BASE_URL")
+            or os.getenv("OLLAMA_HOST")
+            or os.getenv("OLLAMA_BASE_URL")
+            or DEFAULT_OLLAMA_HOST
+        ).rstrip("/")
+    if selected == "network":
+        return (
+            os.getenv("OLLAMA_NETWORK_BASE_URL")
+            or os.getenv("OLLAMA_HOST")
+            or os.getenv("OLLAMA_BASE_URL")
+            or DEFAULT_OLLAMA_HOST
+        ).rstrip("/")
+    return (
+        os.getenv("OLLAMA_LOCAL_HOST")
+        or os.getenv("OLLAMA_LOCAL_BASE_URL")
+        or os.getenv("OLLAMA_HOST")
+        or os.getenv("OLLAMA_BASE_URL")
+        or os.getenv("OLLAMA_NETWORK_BASE_URL")
+        or DEFAULT_OLLAMA_HOST
+    ).rstrip("/")
+
+
 def ollama_model_name() -> str:
-    """Model tag from OLLAMA_LOCAL_PATH or OLLAMA_MODEL (e.g. qwen2.5:7b)."""
-    return (os.getenv("OLLAMA_LOCAL_PATH") or os.getenv("OLLAMA_MODEL") or "").strip()
+    """Model tag from Ollama env vars (e.g. qwen2.5:7b)."""
+    selected = llm_choice_mode()
+    if selected == "local":
+        return _local_ollama_model_name() or (os.getenv("OLLAMA_MODEL") or "").strip()
+    if selected == "network":
+        return _network_ollama_model_name() or (os.getenv("OLLAMA_MODEL") or "").strip()
+    return (
+        _local_ollama_model_name()
+        or (os.getenv("OLLAMA_MODEL") or "").strip()
+        or _network_ollama_model_name()
+    )
+
+
+def planner_model_name(use_ollama: Optional[bool] = None) -> str:
+    """Model for tool-planning turns (can be lighter/faster than report model)."""
+    if use_ollama is None:
+        use_ollama = using_ollama()
+    if use_ollama:
+        selected = llm_choice_mode()
+        if selected == "local":
+            return (
+                os.getenv("AOOB_TOOL_LOCAL_MODEL")
+                or os.getenv("OLLAMA_TOOL_LOCAL_MODEL")
+                or os.getenv("AOOB_TOOL_MODEL")
+                or os.getenv("OLLAMA_TOOL_MODEL")
+                or _local_ollama_model_name()
+                or (os.getenv("OLLAMA_MODEL") or "").strip()
+            ).strip()
+        if selected == "network":
+            return (
+                os.getenv("AOOB_TOOL_NETWORK_MODEL")
+                or os.getenv("OLLAMA_TOOL_NETWORK_MODEL")
+                or os.getenv("AOOB_TOOL_MODEL")
+                or os.getenv("OLLAMA_TOOL_MODEL")
+                or _network_ollama_model_name()
+                or (os.getenv("OLLAMA_MODEL") or "").strip()
+            ).strip()
+        return (
+            os.getenv("AOOB_TOOL_MODEL")
+            or os.getenv("OLLAMA_TOOL_MODEL")
+            or _local_ollama_model_name()
+            or (os.getenv("OLLAMA_MODEL") or "").strip()
+            or _network_ollama_model_name()
+        ).strip()
+    return (
+        os.getenv("AOOB_TOOL_NVIDIA_MODEL")
+        or os.getenv("NVIDIA_TOOL_MODEL")
+        or os.getenv("NVIDIA_MODEL")
+        or DEFAULT_NVIDIA_MODEL
+    ).strip()
+
+
+def ollama_configured() -> bool:
+    return bool(ollama_model_name())
+
+
+def nvidia_configured() -> bool:
+    return bool((os.getenv("NVIDIA_API_KEY") or "").strip())
+
+
+def ollama_runtime_fallback_enabled() -> bool:
+    raw = (os.getenv("AOOB_OLLAMA_RUNTIME_FALLBACK") or "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _ollama_health_timeout() -> float:
+    raw = (os.getenv("OLLAMA_HEALTH_TIMEOUT") or "1.5").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return 1.5
+
+
+def _ollama_available(timeout: Optional[float] = None) -> bool:
+    if not ollama_configured():
+        return False
+    base = ollama_base_url()
+    request = Request(f"{base}/api/tags", headers={"Accept": "application/json"})
+    host = (urlparse(base).hostname or "").strip().lower()
+    bypass_proxy = host in {"127.0.0.1", "localhost", "::1"}
+    try:
+        if bypass_proxy:
+            opener = build_opener(ProxyHandler({}))
+            response_ctx = opener.open(
+                request,
+                timeout=timeout or _ollama_health_timeout(),
+            )
+        else:
+            response_ctx = urlopen(request, timeout=timeout or _ollama_health_timeout())
+        with response_ctx as response:
+            status = getattr(response, "status", 200)
+            return 200 <= status < 300
+    except (OSError, URLError, ValueError):
+        return False
+
+
+def _is_ollama_runtime_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    needles = (
+        "timed out",
+        "timeout",
+        "connection refused",
+        "failed to connect",
+        "connection aborted",
+        "connection reset",
+        "max retries exceeded",
+        "temporarily unavailable",
+        "server disconnected",
+        "network is unreachable",
+    )
+    return any(n in text for n in needles)
 
 
 def llm_backend_override() -> Optional[str]:
@@ -353,50 +325,89 @@ def llm_backend_override() -> Optional[str]:
 
 def using_ollama() -> bool:
     override = llm_backend_override()
+    selected = llm_choice_mode()
     if override == "nvidia":
         return False
+    if selected == "nvidia" and override != "ollama":
+        return False
     if override == "ollama":
-        if not ollama_model_name():
+        if not ollama_configured():
             raise RuntimeError(
-                "AOOB_LLM_BACKEND=ollama but OLLAMA_LOCAL_PATH / OLLAMA_MODEL is unset."
+                "AOOB_LLM_BACKEND=ollama but no Ollama model env is set. "
+                "Use OLLAMA_LOCAL_MODEL/OLLAMA_LOCAL_PATH, OLLAMA_MODEL, or OLLAMA_NETWORK_MODEL."
+            )
+        if not _ollama_available():
+            raise RuntimeError(
+                f"AOOB_LLM_BACKEND=ollama but Ollama is unreachable at {ollama_base_url()}."
             )
         return True
-    return bool(ollama_model_name())
+    return ollama_configured() and _ollama_available()
 
 
-def resolve_model_name(model: Optional[str] = None) -> str:
+def resolve_model_name(
+    model: Optional[str] = None,
+    use_ollama: Optional[bool] = None,
+    role: Literal["planner", "report"] = "report",
+) -> str:
     if model:
         return model
-    if using_ollama():
+    if use_ollama is None:
+        use_ollama = using_ollama()
+    if role == "planner":
+        return planner_model_name(use_ollama=use_ollama)
+    if use_ollama:
         return ollama_model_name()
     return os.getenv("NVIDIA_MODEL", DEFAULT_NVIDIA_MODEL) or DEFAULT_NVIDIA_MODEL
 
 
-def llm_backend_label() -> str:
+def llm_backend_label(role: Literal["planner", "report"] = "report") -> str:
     if using_ollama():
-        return f"Ollama ({resolve_model_name()})"
-    return f"NVIDIA ({resolve_model_name()})"
+        return f"Ollama ({resolve_model_name(role=role)})"
+    return f"NVIDIA ({resolve_model_name(role=role)})"
 
 
-def build_llm(model: Optional[str] = None) -> Any:
-    name = resolve_model_name(model)
-    timeout = float(os.getenv("OLLAMA_TIMEOUT" if using_ollama() else "NVIDIA_TIMEOUT", "300"))
-    if using_ollama():
+def planner_backend_label() -> str:
+    return llm_backend_label(role="planner")
+
+
+def report_backend_label() -> str:
+    return llm_backend_label(role="report")
+
+
+def build_llm(
+    model: Optional[str] = None,
+    backend: Optional[str] = None,
+    role: Literal["planner", "report"] = "report",
+) -> Any:
+    if backend == "ollama":
+        use_ollama = True
+    elif backend == "nvidia":
+        use_ollama = False
+    else:
+        use_ollama = using_ollama()
+    name = resolve_model_name(model, use_ollama=use_ollama, role=role)
+    selected = llm_choice_mode()
+    timeout = float(os.getenv("OLLAMA_TIMEOUT" if use_ollama else "NVIDIA_TIMEOUT", "300"))
+    if (
+        not use_ollama
+        and selected != "nvidia"
+        and ollama_configured()
+        and nvidia_configured()
+        and not llm_backend_override()
+    ):
+        _log(f"[llm] ollama unreachable at {ollama_base_url()}; falling back to nvidia")
+    if use_ollama:
         try:
             from langchain_ollama import ChatOllama
         except ImportError as exc:
             raise RuntimeError(
-                "OLLAMA_LOCAL_PATH is set but langchain-ollama is not installed. "
+                "An Ollama model is configured but langchain-ollama is not installed. "
                 "Run: py -3.13 -m pip install langchain-ollama"
             ) from exc
-        base_url = (
-            os.getenv("OLLAMA_HOST")
-            or os.getenv("OLLAMA_BASE_URL")
-            or DEFAULT_OLLAMA_HOST
-        ).rstrip("/")
+        base_url = ollama_base_url()
         num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "16384"))
         _log(
-            f"[llm] backend=ollama model={name} base_url={base_url} "
+            f"[llm] role={role} backend=ollama model={name} base_url={base_url} "
             f"num_ctx={num_ctx} timeout={timeout}s"
         )
         return ChatOllama(
@@ -411,12 +422,12 @@ def build_llm(model: Optional[str] = None) -> Any:
     api_key = os.getenv("NVIDIA_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "NVIDIA_API_KEY missing (and OLLAMA_LOCAL_PATH is unset). "
-            "Set one of them in .env."
+            "NVIDIA_API_KEY missing and no reachable Ollama backend was found. "
+            "Set NVIDIA_API_KEY or configure a reachable Ollama model/base URL in .env."
         )
     from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
-    _log(f"[llm] backend=nvidia model={name} timeout={timeout}s")
+    _log(f"[llm] role={role} backend=nvidia model={name} timeout={timeout}s")
     return ChatNVIDIA(
         model=name,
         api_key=api_key,
@@ -455,164 +466,433 @@ def _parse_tool_json(content: str) -> Optional[dict]:
         return None
 
 
-def _index_candidates_from_messages(messages: list) -> list[str]:
-    """Pull index_operand_candidates from get_affected_symbols tool results."""
-    found: list[str] = []
-    seen: set[str] = set()
-    for m in messages:
-        if not isinstance(m, ToolMessage):
-            continue
-        if getattr(m, "name", None) != "get_affected_symbols":
-            continue
-        data = _parse_tool_json(str(m.content))
-        if not data:
-            continue
-        for c in data.get("index_operand_candidates") or []:
-            c = str(c).strip()
-            if c and c not in seen:
-                seen.add(c)
-                found.append(c)
-    return found
-
-
-def _indexed_objects_from_messages(messages: list) -> set[str]:
-    objs: set[str] = set()
-    for m in messages:
-        if not isinstance(m, ToolMessage):
-            continue
-        if getattr(m, "name", None) not in {
-            "get_affected_symbols",
-            "get_declaration_bounds",
-        }:
-            continue
-        data = _parse_tool_json(str(m.content))
-        if not data:
-            continue
-        for o in data.get("indexed_objects") or []:
-            objs.add(str(o))
-            objs.add(str(o).split(".")[-1])
-        if data.get("symbol"):
-            objs.add(str(data["symbol"]))
-            objs.add(str(data["symbol"]).split(".")[-1])
-        if data.get("found") and data.get("symbol"):
-            objs.add(str(data["symbol"]))
-    return objs
-
-
-def _origin_slice_targets(messages: list) -> list[str]:
-    """variable_name args used with index-origin tools."""
-    targets: list[str] = []
-    for m in messages:
-        if not isinstance(m, AIMessage):
-            continue
-        for tc in getattr(m, "tool_calls", None) or []:
-            if (tc.get("name") or "") not in _ORIGIN_TOOLS:
-                continue
-            args = tc.get("args") or {}
-            name = args.get("variable_name") or args.get("symbol_name")
-            if name:
-                targets.append(str(name).strip().split("@", 1)[0].strip('"'))
-            pname = args.get("parameter_name")
-            if pname:
-                targets.append(str(pname).strip().split("@", 1)[0].strip('"'))
-    return targets
-
-
-def _target_matches_candidate(target: str, candidates: list[str]) -> bool:
-    t = target.strip()
-    t_tail = t.split(".")[-1]
-    for c in candidates:
-        if t == c or t_tail == c or t == c.split(".")[-1] or t_tail == c.split(".")[-1]:
-            return True
-        if c.endswith("." + t) or c.endswith("." + t_tail):
-            return True
-    return False
-
-
-def _has_useful_index_origin_tool(messages: list) -> bool:
-    """True only if an origin tool targeted a real index candidate (not the array)."""
-    targets = _origin_slice_targets(messages)
-    if not targets:
-        return False
-    candidates = _index_candidates_from_messages(messages)
-    indexed = _indexed_objects_from_messages(messages)
-    if candidates:
-        return any(_target_matches_candidate(t, candidates) for t in targets)
-    # Fallback when parser found no candidates: any origin tool whose target is
-    # not the indexed array/object.
-    return any(t not in indexed and t.split(".")[-1] not in indexed for t in targets)
-
-
-def _call_site_followup_info(messages: list) -> Optional[dict]:
-    """If a slice reported a parameter with next_slice_candidates, return them."""
+def _latest_trimmed_sequence(messages: list) -> Optional[dict]:
     for m in reversed(messages):
         if not isinstance(m, ToolMessage):
             continue
-        if getattr(m, "name", None) not in {
-            "get_backward_slice",
-            "get_call_site_arguments",
-        }:
+        if getattr(m, "name", None) != "get_trimmed_sequence":
+            continue
+        data = _parse_tool_json(str(m.content))
+        if data:
+            return data
+    return None
+
+
+def _coerce_xml_scalar(text: str) -> Any:
+    val = (text or "").strip()
+    if re.fullmatch(r"-?\d+", val):
+        try:
+            return int(val)
+        except ValueError:
+            return val
+    if re.fullmatch(r"-?\d+\.\d+", val):
+        try:
+            return float(val)
+        except ValueError:
+            return val
+    low = val.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    if low in {"none", "null"}:
+        return None
+    return val
+
+
+def parse_llm_tool_response(llm_output: str) -> dict[str, Any]:
+    """Parse tool calls from model text with JSON first, then XML fallback."""
+    cleaned_output = (llm_output or "").strip()
+
+    # 1) Standard JSON attempt (with optional markdown-fence stripping).
+    try:
+        json_candidate = cleaned_output
+        if json_candidate.startswith("```"):
+            lines = json_candidate.splitlines()
+            if len(lines) >= 2 and (lines[0].startswith("```json") or lines[0].startswith("```")):
+                json_candidate = "\n".join(lines[1:-1]).strip()
+        payload = json.loads(json_candidate)
+    except Exception:  # noqa: BLE001
+        payload = None
+
+    if isinstance(payload, dict):
+        if payload.get("type") == "tool" and payload.get("name"):
+            return {
+                "type": "tool",
+                "name": str(payload.get("name")),
+                "args": payload.get("args") if isinstance(payload.get("args"), dict) else {},
+            }
+        if payload.get("name") and isinstance(payload.get("arguments"), dict):
+            return {
+                "type": "tool",
+                "name": str(payload.get("name")),
+                "args": dict(payload.get("arguments") or {}),
+            }
+        if payload.get("name") and isinstance(payload.get("args"), dict):
+            return {
+                "type": "tool",
+                "name": str(payload.get("name")),
+                "args": dict(payload.get("args") or {}),
+            }
+        tool_calls = payload.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            tc0 = tool_calls[0] if isinstance(tool_calls[0], dict) else None
+            if tc0 and tc0.get("name"):
+                args = tc0.get("args") or tc0.get("arguments") or {}
+                return {
+                    "type": "tool",
+                    "name": str(tc0.get("name")),
+                    "args": args if isinstance(args, dict) else {},
+                }
+
+    # 2) XML fallback for <tool_call> ... </tool_call>
+    xml_match = re.search(
+        r"<tool_call>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_call>",
+        llm_output or "",
+        re.DOTALL | re.IGNORECASE,
+    )
+    if xml_match:
+        tool_name = (xml_match.group(1) or "").strip()
+        args_content = (xml_match.group(2) or "").strip()
+        try:
+            tool_args = json.loads(args_content)
+            if isinstance(tool_args, dict):
+                return {"type": "tool", "name": tool_name, "args": tool_args}
+        except Exception:  # noqa: BLE001
+            pass
+
+        arg_pairs = re.findall(r"<([A-Za-z_][\w\-]*)>(.*?)</\1>", args_content, re.DOTALL)
+        if arg_pairs:
+            tool_args = {k.strip(): _coerce_xml_scalar(v) for k, v in arg_pairs}
+            return {"type": "tool", "name": tool_name, "args": tool_args}
+
+    return {"type": "no_tool_call"}
+
+
+def _recover_tool_calls_from_text(text: str) -> list[dict[str, Any]]:
+    """Recover tool calls from malformed LLM content (JSON/XML/noisy markdown)."""
+    if not text.strip():
+        return []
+
+    known = {t.name for t in TOOLS}
+    recovered: list[dict[str, Any]] = []
+
+    # First pass: single-call robust parser requested for noisy outputs.
+    parsed = parse_llm_tool_response(text)
+    if parsed.get("type") == "tool" and parsed.get("name") in known:
+        recovered.append(
+            {
+                "name": str(parsed.get("name")),
+                "args": parsed.get("args") if isinstance(parsed.get("args"), dict) else {},
+                "id": f"fallback-{uuid4()}",
+                "type": "tool_call",
+            }
+        )
+
+    # Second pass: allow multiple XML tool_call blocks if present.
+    xml_blocks = re.finditer(
+        r"<tool_call>\s*<name>(.*?)</name>\s*<arguments>(.*?)</arguments>\s*</tool_call>",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    )
+    for m in xml_blocks:
+        name = (m.group(1) or "").strip()
+        if name not in known:
+            continue
+        args_body = (m.group(2) or "").strip()
+        args: dict[str, Any] = {}
+        try:
+            obj = json.loads(args_body)
+            if isinstance(obj, dict):
+                args = obj
+        except Exception:  # noqa: BLE001
+            pairs = re.findall(r"<([A-Za-z_][\w\-]*)>(.*?)</\1>", args_body, re.DOTALL)
+            if pairs:
+                args = {k.strip(): _coerce_xml_scalar(v) for k, v in pairs}
+        recovered.append(
+            {
+                "name": name,
+                "args": args,
+                "id": f"fallback-{uuid4()}",
+                "type": "tool_call",
+            }
+        )
+
+    # De-dup by (name,args) while preserving order.
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for tc in recovered:
+        sig = json.dumps({"name": tc.get("name"), "args": tc.get("args")}, sort_keys=True)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append(tc)
+    return out
+
+
+def _latest_trimmed_sequence_with_index(messages: list) -> tuple[Optional[dict], int]:
+    for i in range(len(messages) - 1, -1, -1):
+        m = messages[i]
+        if not isinstance(m, ToolMessage):
+            continue
+        if getattr(m, "name", None) != "get_trimmed_sequence":
+            continue
+        data = _parse_tool_json(str(m.content))
+        if data:
+            return data, i
+    return None, -1
+
+
+def _stable_progress_payload(name: str, data: dict) -> Optional[str]:
+    """Canonical payload snapshot for no-progress loop detection."""
+    if name == "get_trimmed_sequence":
+        snap = {
+            "variable": data.get("variable"),
+            "origin_resolved": data.get("origin_resolved"),
+            "total_steps": data.get("total_steps"),
+            "sequence": data.get("sequence") or [],
+            "scope_mode": data.get("scope_mode"),
+            "trace_function": data.get("trace_function"),
+        }
+        return json.dumps(snap, sort_keys=True, separators=(",", ":"))
+    if name == "get_caller_context":
+        snap = {
+            "current_function": data.get("current_function"),
+            "callers": data.get("callers") or [],
+            "unresolved": data.get("unresolved"),
+        }
+        return json.dumps(snap, sort_keys=True, separators=(",", ":"))
+    return None
+
+
+def _origin_progress_stalled(messages: list) -> bool:
+    """True when origin-tracing tool hops repeat without new information."""
+    relevant: list[tuple[str, str]] = []
+    for m in messages:
+        if not isinstance(m, ToolMessage):
+            continue
+        name = getattr(m, "name", None)
+        if name not in _ORIGIN_TOOLS:
             continue
         data = _parse_tool_json(str(m.content))
         if not data:
             continue
-        csa = data.get("call_site_arguments")
-        if isinstance(csa, dict):
-            nxt = [str(x) for x in (csa.get("next_slice_candidates") or []) if x]
-            if nxt or data.get("parameter_note"):
-                return {
-                    "next_slice_candidates": nxt,
-                    "parameter": data.get("variable") or csa.get("parameter_name"),
-                    "callee": data.get("start_function") or csa.get("callee"),
-                }
-        nxt = [str(x) for x in (data.get("next_slice_candidates") or []) if x]
-        if nxt:
-            return {
-                "next_slice_candidates": nxt,
-                "parameter": data.get("parameter_name") or data.get("variable"),
-                "callee": data.get("callee") or data.get("start_function"),
-            }
-        if data.get("parameter_note"):
-            return {
-                "next_slice_candidates": [],
-                "parameter": data.get("variable"),
-                "callee": data.get("start_function"),
-            }
-    return None
-
-
-def _has_call_site_argument_followup(messages: list) -> bool:
-    """True if an origin tool targeted a call-site argument (not only the param)."""
-    info = _call_site_followup_info(messages)
-    if not info:
-        return True  # no parameter path → nothing to follow up
-    nxt = info.get("next_slice_candidates") or []
-    if not nxt:
-        return "get_call_site_arguments" in _tool_names_used(messages)
-    targets = _origin_slice_targets(messages)
-    param = str(info.get("parameter") or "")
-    param_tail = param.split(".")[-1]
-    for t in targets:
-        if t == param or t.split(".")[-1] == param_tail:
+        stable = _stable_progress_payload(str(name), data)
+        if not stable:
             continue
-        if _target_matches_candidate(t, nxt):
-            return True
+        relevant.append((str(name), stable))
+
+    if len(relevant) < 2:
+        return False
+
+    # Same tool called twice with identical result.
+    if relevant[-1] == relevant[-2]:
+        return True
+
+    # Alternating seq/caller cycle repeating the same pair.
+    if len(relevant) >= 4:
+        a, b, c, d = relevant[-4], relevant[-3], relevant[-2], relevant[-1]
+        if a[0] != b[0] and c[0] != d[0] and a[0] == c[0] and b[0] == d[0]:
+            if a[1] == c[1] and b[1] == d[1]:
+                return True
     return False
 
 
-def _needs_call_site_followup(messages: list) -> bool:
-    info = _call_site_followup_info(messages)
-    if not info:
+def _tool_payload_signature(msg: ToolMessage) -> str:
+    name = str(getattr(msg, "name", "") or "")
+    payload = _parse_tool_json(str(msg.content))
+    if payload is None:
+        payload_txt = str(msg.content).strip()
+    else:
+        payload_txt = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return f"{name}|{payload_txt}"
+
+
+def _any_tool_loop_stalled(messages: list) -> bool:
+    """Detect repeated identical tool-result patterns across all tools."""
+    tool_msgs = [m for m in messages if isinstance(m, ToolMessage)]
+    if len(tool_msgs) < 2:
         return False
-    return not _has_call_site_argument_followup(messages)
+
+    sigs = [_tool_payload_signature(m) for m in tool_msgs]
+
+    # Same tool result repeated back-to-back.
+    if len(sigs) >= 2 and sigs[-1] == sigs[-2]:
+        return True
+
+    # Two-step cycle repeated (A,B,A,B).
+    if len(sigs) >= 4:
+        if sigs[-4] == sigs[-2] and sigs[-3] == sigs[-1]:
+            return True
+
+    # Three-step cycle repeated (A,B,C,A,B,C).
+    if len(sigs) >= 6:
+        if sigs[-6:-3] == sigs[-3:]:
+            return True
+
+    return False
+
+
+_OFFTOPIC_HINTS = (
+    "autosar",
+    "overview",
+    "summary table",
+    "embedded software module",
+    "architecture",
+    "electronic control unit",
+)
+
+
+def _is_offtopic_no_tool_text(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    # Legit planner no-op marker.
+    if '{"type":"no_tool_call"}' in t.replace(" ", ""):
+        return False
+    # Obvious tool call/XML snippets are not off-topic.
+    if "<tool_call>" in t or '"tool_calls"' in t or '"name"' in t and '"arguments"' in t:
+        return False
+    return any(h in t for h in _OFFTOPIC_HINTS)
+
+
+def _latest_index_operand(messages: list) -> Optional[str]:
+    for m in reversed(messages):
+        if not isinstance(m, ToolMessage):
+            continue
+        if getattr(m, "name", None) != "get_function_snippet":
+            continue
+        data = _parse_tool_json(str(m.content))
+        if not data:
+            continue
+        ops = data.get("index_operands_at_alarm") or []
+        if not isinstance(ops, list) or not ops:
+            continue
+        first = ops[0] if isinstance(ops[0], dict) else None
+        if not first:
+            continue
+        operand = str(first.get("operand_text") or "").strip()
+        if operand:
+            return operand
+    return None
+
+
+def _latest_index_operand_symbol(messages: list) -> Optional[str]:
+    for m in reversed(messages):
+        if not isinstance(m, ToolMessage):
+            continue
+        if getattr(m, "name", None) != "get_function_snippet":
+            continue
+        data = _parse_tool_json(str(m.content))
+        if not data:
+            continue
+        ops = data.get("index_operands_at_alarm") or []
+        if not isinstance(ops, list):
+            continue
+        for op in ops:
+            if not isinstance(op, dict):
+                continue
+            resolved = str(op.get("resolved_operand_symbol") or "").strip()
+            if resolved:
+                return resolved
+            operand = str(op.get("operand_text") or "").strip()
+            if operand:
+                return operand
+    return None
+
+
+def _latest_scope_for_symbol(messages: list, symbol: str) -> Optional[str]:
+    tail = _ident_tail(symbol)
+    if not tail:
+        return None
+    for m in reversed(messages):
+        if not isinstance(m, ToolMessage):
+            continue
+        if getattr(m, "name", None) != "get_variable_scope":
+            continue
+        data = _parse_tool_json(str(m.content))
+        if not data:
+            continue
+        sym = _ident_tail(str(data.get("symbol") or ""))
+        if sym == tail:
+            scope = str(data.get("scope") or "").strip().lower()
+            if scope:
+                return scope
+    return None
+
+
+def _has_useful_index_origin_tool(messages: list) -> bool:
+    data = _latest_trimmed_sequence(messages)
+    if not data:
+        return False
+    if not bool(data.get("origin_resolved")):
+        return False
+    operand = _latest_index_operand(messages)
+    if not operand:
+        return True
+    traced = str(data.get("variable") or "")
+    if not traced:
+        return False
+    return _ident_tail(traced) == _ident_tail(operand)
+
+
+def _needs_caller_followup(messages: list) -> bool:
+    data, seq_idx = _latest_trimmed_sequence_with_index(messages)
+    if not data:
+        return False
+    if bool(data.get("origin_resolved")):
+        return False
+
+    traced = str(data.get("variable") or "")
+    if not traced:
+        return False
+
+    scope = _latest_scope_for_symbol(messages, traced)
+    if scope != "parameter":
+        return False
+
+    if seq_idx < 0:
+        return False
+    for m in messages[seq_idx + 1 :]:
+        if isinstance(m, ToolMessage) and getattr(m, "name", None) == "get_caller_context":
+            return False
+    return True
+
+
+def _pending_hop_target(messages: list) -> Optional[str]:
+    target: Optional[str] = None
+    for m in messages:
+        if not isinstance(m, ToolMessage):
+            continue
+        name = getattr(m, "name", None)
+        data = _parse_tool_json(str(m.content))
+        if not data:
+            continue
+        if name == "get_caller_context":
+            if data.get("unresolved") is True:
+                target = None
+                continue
+            callers = data.get("callers") or []
+            if callers and isinstance(callers[0], dict):
+                target = str(callers[0].get("function") or "").strip() or None
+        elif name == "get_trimmed_sequence" and target:
+            # Any follow-up trimmed sequence after a caller hop satisfies this gate.
+            target = None
+    return target
+
+
+def _needs_call_site_followup(messages: list) -> bool:
+    return _needs_caller_followup(messages)
 
 
 def _saw_parameter_note(messages: list) -> bool:
     for m in messages:
         if not isinstance(m, ToolMessage):
             continue
+        if getattr(m, "name", None) != "get_variable_scope":
+            continue
         data = _parse_tool_json(str(m.content))
-        if data and (data.get("parameter_note") or data.get("call_site_arguments")):
+        if data and data.get("scope") == "parameter":
             return True
     return False
 
@@ -626,62 +906,146 @@ def _is_oob_alarm(store: DataStore, order_id: int) -> bool:
 
 
 def _build_origin_nudge(messages: list) -> str:
-    cands = _index_candidates_from_messages(messages)
-    wrong = _origin_slice_targets(messages)
     lines = [INDEX_ORIGIN_NUDGE]
-    if cands:
+    seq = _latest_trimmed_sequence(messages) or {}
+    operand = _latest_index_operand(messages)
+    if operand:
+        lines.append(f"Index operand candidate from snippet: {operand!r}")
+    if seq:
         lines.append(
-            "index_operand_candidates from tools: "
-            + ", ".join(cands[:12])
-        )
-    if wrong:
-        lines.append(
-            "You already sliced these (not accepted as index operands): "
-            + ", ".join(wrong)
-            + ". Slice a candidate instead."
+            f"Latest variable={seq.get('variable')!r}, "
+            f"origin_resolved={seq.get('origin_resolved')}, total_steps={seq.get('total_steps')}"
         )
     return "\n".join(lines)
 
 
-def _build_call_site_nudge(messages: list) -> str:
-    info = _call_site_followup_info(messages) or {}
-    lines = [CALL_SITE_NUDGE]
-    nxt = info.get("next_slice_candidates") or []
-    if nxt:
-        lines.append(
-            "next_slice_candidates from tools: " + ", ".join(nxt[:12])
-        )
-    if info.get("callee") and info.get("parameter"):
-        lines.append(
-            "Suggested get_call_site_arguments("
-            f"callee_function={info['callee']!r}, "
-            f"parameter_name={info['parameter']!r}) if args missing."
-        )
-    return "\n".join(lines)
+def _tool_call_templates(
+    *,
+    tool_name: str,
+    order_id: int,
+    variable: str = "",
+) -> str:
+    if tool_name == "get_caller_context":
+        args = {
+            "parameter": variable,
+            "alarm_order_id": order_id,
+        }
+    elif tool_name == "get_trimmed_sequence":
+        args = {
+            "alarm_order_id": order_id,
+            "variable": variable,
+        }
+    elif tool_name == "get_variable_scope":
+        args = {
+            "symbol": variable,
+            "alarm_order_id": order_id,
+        }
+    elif tool_name == "get_declaration_info":
+        args = {
+            "symbol": variable,
+        }
+    else:
+        args = {
+            "alarm_order_id": order_id,
+        }
 
-
-def _build_guard_nudge(messages: list) -> str:
-    info = _call_site_followup_info(messages) or {}
-    nxt = info.get("next_slice_candidates") or []
-    cands = nxt or _index_candidates_from_messages(messages)
-    lines = [GUARD_NUDGE]
-    if cands:
-        lines.append(
-            "Suggested variable_name for get_condition_guards: "
-            + cands[0]
-        )
-    return "\n".join(lines)
-
-
-def _parameter_path_open(messages: list) -> bool:
-    return _needs_call_site_followup(messages) or (
-        _saw_parameter_note(messages)
-        and not _has_call_site_argument_followup(messages)
+    json_call = json.dumps({"name": tool_name, "arguments": args}, indent=2)
+    xml_parts = [
+        "<tool_call>",
+        f"  <name>{tool_name}</name>",
+        "  <arguments>",
+    ]
+    for k, v in args.items():
+        xml_parts.append(f"    <{k}>{v}</{k}>")
+    xml_parts += [
+        "  </arguments>",
+        "</tool_call>",
+    ]
+    return (
+        "Call exactly this tool next.\n"
+        "JSON tool-call schema:\n"
+        f"{json_call}\n\n"
+        "XML tool-call schema:\n"
+        + "\n".join(xml_parts)
     )
 
 
+def _build_dynamic_nudge(messages: list, order_id: int) -> str:
+    operand = _latest_index_operand_symbol(messages) or _latest_index_operand(messages) or ""
+    seq = _latest_trimmed_sequence(messages) or {}
+    traced = str(seq.get("variable") or "").strip() or operand
+
+    if "get_function_snippet" not in _tool_names_used(messages):
+        return (
+            "You returned reasoning but no tool call. Retrieve the alarm-site index expression first.\n"
+            + _tool_call_templates(
+                tool_name="get_function_snippet",
+                order_id=order_id,
+            )
+        )
+
+    if not _has_useful_index_origin_tool(messages):
+        target = traced or operand
+        return (
+            "You must trace the index operand now; do not continue with prose-only reasoning.\n"
+            f"Target symbol: {target}\n"
+            + _tool_call_templates(
+                tool_name="get_trimmed_sequence",
+                order_id=order_id,
+                variable=target,
+            )
+        )
+
+    if _needs_call_site_followup(messages):
+        target = traced or operand
+        return (
+            "Caller-side parameter origin is still open.\n"
+            f"Target parameter: {target}\n"
+            + _tool_call_templates(
+                tool_name="get_caller_context",
+                order_id=order_id,
+                variable=target,
+            )
+        )
+
+    if _guards_missing(messages):
+        return (
+            "Collect guard/sentinel evidence from source before finalizing.\n"
+            + _tool_call_templates(
+                tool_name="get_function_snippet",
+                order_id=order_id,
+            )
+        )
+
+    target = traced or operand
+    return (
+        "Ground the verdict with one more trace step on the same index symbol.\n"
+        f"Target symbol: {target}\n"
+        + _tool_call_templates(
+            tool_name="get_trimmed_sequence",
+            order_id=order_id,
+            variable=target,
+        )
+    )
+
+
+def _build_call_site_nudge(messages: list) -> str:
+    return CALLER_NUDGE
+
+
+def _build_guard_nudge(messages: list) -> str:
+    return (
+        "Before finishing, call get_function_snippet in the current trace context "
+        "and cite any in-snippet guard/sentinel/shift evidence directly."
+    )
+
+
+def _parameter_path_open(messages: list) -> bool:
+    return _needs_call_site_followup(messages)
+
+
 def _guards_missing(messages: list) -> bool:
-    return "get_condition_guards" not in _tool_names_used(messages)
+    return "get_function_snippet" not in _tool_names_used(messages)
 
 
 _IDENT_TOKEN_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
@@ -718,44 +1082,38 @@ _SKIP_IDENT_TOKENS = frozenset(
         "volatile",
     }
 )
-_UNRESOLVABLE_RE = re.compile(
-    r"(no declaration|no #define|no data-flow|name must be a bare|"
-    r"index miss|macro-built|could not resolve|value left unresolved|"
-    r"no DF keys|unknown symbol|not a plain integer)",
-    re.IGNORECASE,
-)
 _TRANSFORM_RE = re.compile(r">>|<<|(?<!&)&(?!&)|(?<!\|)\|(?!\|)|\^")
-_CF_BOUNDARY_RE = re.compile(r"caller|max_depth|truncated", re.IGNORECASE)
 
 _SITE_TOOL_NAMES = (
-    "get_affected_symbols",
     "get_function_snippet",
-    "get_declaration_bounds",
+    "get_trimmed_sequence",
+    "get_variable_scope",
+    "get_declaration_info",
 )
 _HOP_TOOL_NAMES = (
-    "get_backward_slice",
-    "get_all_writes_to_symbol",
-    "get_call_site_arguments",
+    "get_caller_context",
+    "get_trimmed_sequence",
+    "get_function_snippet",
 )
 _ORIGIN_CORE_NAMES = (
-    "get_backward_slice",
-    "get_all_writes_to_symbol",
-    "get_declaration_bounds",
+    "get_trimmed_sequence",
+    "get_variable_scope",
+    "get_declaration_info",
 )
 _CALLSITE_TOOL_NAMES = (
-    "get_call_site_arguments",
-    "get_backward_slice",
-    "get_condition_guards",
+    "get_caller_context",
+    "get_trimmed_sequence",
+    "get_function_snippet",
 )
 _GUARD_TOOL_NAMES = (
-    "get_condition_guards",
-    "get_index_expression_structure",
-    "resolve_symbolic_constant",
+    "get_function_snippet",
+    "get_declaration_info",
+    "get_variable_scope",
 )
 _FOLLOW_TOOL_NAMES = (
-    "get_backward_slice",
-    "get_index_expression_structure",
-    "get_condition_guards",
+    "get_function_snippet",
+    "get_trimmed_sequence",
+    "get_caller_context",
 )
 
 
@@ -791,28 +1149,15 @@ def _ident_tail(name: str) -> str:
 
 
 def _idents_from_c_text(text: str) -> list[str]:
-    """Identifiers in an assignment / argument expression (not a verdict)."""
+    """Identifiers in plain C-like text (no semantic inference)."""
     found: list[str] = []
     seen: set[str] = set()
-
-    def _add(raw: str) -> None:
-        name = _ident_norm(raw)
+    for m in _IDENT_TOKEN_RE.finditer(text or ""):
+        name = _ident_norm(m.group(1))
         if not name or name.lower() in _SKIP_IDENT_TOKENS or name in seen:
-            return
-        if len(name) < 2:
-            return
-        if (name.startswith("Get") or name.startswith("Mo_Inst_Get")) and (
-            name.endswith("Idx") or re.search(r"Get\w*Idx$", name)
-        ):
-            return
+            continue
         seen.add(name)
         found.append(name)
-
-    ops = extract_index_operands([text or ""])
-    for c in ops.get("index_operand_candidates") or []:
-        _add(str(c))
-    for m in _IDENT_TOKEN_RE.finditer(text or ""):
-        _add(m.group(1))
     return found
 
 
@@ -832,20 +1177,11 @@ def _payload_about_symbol(data: dict, symbol: str) -> bool:
     return False
 
 
-def _df_keys_matched(data: dict) -> Optional[list]:
-    if "df_keys_matched" in data:
-        keys = data.get("df_keys_matched")
-        return keys if isinstance(keys, list) else None
-    lookup = data.get("lookup")
-    if isinstance(lookup, dict) and "df_keys_matched" in lookup:
-        keys = lookup.get("df_keys_matched")
-        return keys if isinstance(keys, list) else None
-    return None
-
-
 def _payload_writes(data: dict) -> list:
-    writes = data.get("writes_found") or data.get("writes") or []
-    return writes if isinstance(writes, list) else []
+    writes = data.get("sequence") or data.get("writes") or []
+    if not isinstance(writes, list):
+        return []
+    return [w for w in writes if isinstance(w, dict) and w.get("access") == "write"]
 
 
 def _looks_like_aggregate(name: str) -> bool:
@@ -856,36 +1192,14 @@ def _looks_like_aggregate(name: str) -> bool:
     )
 
 
-def _simple_rhs_ident(text: str) -> Optional[str]:
-    """Bare identifier on an assignment RHS (optional cast). None if the RHS is complex."""
-    bits = re.split(r"(?<![=!<>])=(?![=])", text or "", maxsplit=1)
-    rhs = (bits[1] if len(bits) == 2 else text or "").strip().rstrip(";").strip()
-    rhs = re.sub(r"/\*.*?\*/", " ", rhs)
-    rhs = re.sub(r"//.*$", "", rhs)
-    rhs = re.sub(r"^\(\s*[A-Za-z_]\w*(?:\s*\*)?\s*\)\s*", "", rhs).strip()
-    m = re.fullmatch(r"[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)?", rhs)
-    if not m:
-        return None
-    return re.sub(r"\s+", "", m.group(0))
-
-
 def _named_next_from_payload(data: dict) -> list[str]:
-    """Identifiers a tool result named as the next origin to retrieve.
-
-    Only call-site candidates, a bare assignment RHS, or subscript operands —
-    not every token in a complex write (that chained 2475 into array/macro names).
-    """
-    sliced = _ident_norm(
-        str(data.get("variable") or data.get("symbol") or data.get("parameter_name") or "")
-    )
+    """Identifiers explicitly surfaced by caller context argument expressions."""
     named: list[str] = []
     seen: set[str] = set()
 
     def _add(raw: str) -> None:
         name = _ident_norm(raw)
         if not name or name.lower() in _SKIP_IDENT_TOKENS:
-            return
-        if name == sliced or _ident_tail(name) == _ident_tail(sliced):
             return
         if _looks_like_aggregate(name):
             return
@@ -895,76 +1209,26 @@ def _named_next_from_payload(data: dict) -> list[str]:
         seen.add(key)
         named.append(name)
 
-    csa = data.get("call_site_arguments")
-    if isinstance(csa, dict):
-        for c in csa.get("next_slice_candidates") or []:
-            _add(str(c))
-    for c in data.get("next_slice_candidates") or []:
-        _add(str(c))
-    for w in _payload_writes(data):
-        if not isinstance(w, dict):
+    for c in data.get("callers") or []:
+        if not isinstance(c, dict):
             continue
-        text = str(w.get("assigned_expression_text") or "")
-        simple = _simple_rhs_ident(text)
-        if simple:
-            _add(simple)
-            continue
-        bits = re.split(r"(?<![=!<>])=(?![=])", text, maxsplit=1)
-        rhs = bits[1] if len(bits) == 2 else text
-        ops = extract_index_operands([rhs])
-        for c in ops.get("index_operand_candidates") or []:
-            _add(str(c))
-    operand = data.get("operand")
-    if operand and not _looks_like_aggregate(str(operand)):
-        _add(str(operand))
+        for ident in c.get("argument_identifiers") or []:
+            _add(str(ident))
     return named
 
 
 def symbol_explicitly_unresolvable(messages: list, symbol: str) -> bool:
-    """True when a tool reported this name as a miss / macro / empty DF — not CF depth."""
+    """True when caller context explicitly reports unresolved."""
     if not symbol:
         return False
     for m in messages:
         if not isinstance(m, ToolMessage):
             continue
         data = _parse_tool_json(str(m.content))
-        if not data or not _payload_about_symbol(data, symbol):
+        if not data:
             continue
-        parse_note = str(data.get("parse_note") or "")
-        if data.get("found") is False and parse_note:
+        if getattr(m, "name", None) == "get_caller_context" and data.get("unresolved") is True:
             return True
-        if (
-            data.get("found") is True
-            and data.get("value") is None
-            and "unresolved" in parse_note.lower()
-        ):
-            return True
-        if data.get("parameter_note") or data.get("call_site_arguments"):
-            continue
-        writes = _payload_writes(data)
-        keys = _df_keys_matched(data)
-        if not writes and keys == []:
-            return True
-        if parse_note and not writes and _UNRESOLVABLE_RE.search(parse_note):
-            return True
-        # Targeted origin lookup of a macro/enum with no writes: tool has
-        # answered; do not chain retries on the ALL_CAPS spelling.
-        tool_name = getattr(m, "name", None)
-        tail = _ident_tail(symbol)
-        if (
-            not writes
-            and not data.get("parameter_note")
-            and tool_name in _ORIGIN_TOOLS
-            and tail.isupper()
-            and "_" in tail
-        ):
-            return True
-        for u in data.get("unresolved_paths") or []:
-            reason = str(u.get("reason") if isinstance(u, dict) else u)
-            if _CF_BOUNDARY_RE.search(reason):
-                continue
-            if not writes and _UNRESOLVABLE_RE.search(reason):
-                return True
     return False
 
 
@@ -977,61 +1241,17 @@ def _symbol_origin_succeeded(messages: list, symbol: str) -> bool:
             continue
         if _payload_writes(data):
             return True
-        if data.get("call_site_arguments"):
-            return True
-        conds = (
-            data.get("conditions")
-            or data.get("guards")
-            or data.get("guards_found")
-            or []
-        )
-        if conds:
-            return True
-        if data.get("found") is True and data.get("operations"):
-            return True
-        if data.get("found") is True and data.get("value") is not None:
-            return True
-        if data.get("found") is True and data.get("kind") in {"define", "enum_member"}:
+        if getattr(m, "name", None) == "get_trimmed_sequence" and _payload_writes(data):
             return True
     return False
 
 
 def pending_named_hop(messages: list) -> Optional[str]:
-    """First identifier named by origin tools that is not yet retrieved or released."""
-    indexed = _indexed_objects_from_messages(messages)
-    indexed_tails = {_ident_tail(o) for o in indexed}
-    named: list[str] = []
-    seen: set[str] = set()
-    for m in messages:
-        if not isinstance(m, ToolMessage):
-            continue
-        if getattr(m, "name", None) not in (
-            _ORIGIN_TOOLS
-            | {"get_index_expression_structure", "get_condition_guards"}
-        ):
-            continue
-        data = _parse_tool_json(str(m.content))
-        if not data:
-            continue
-        for ident in _named_next_from_payload(data):
-            tail = _ident_tail(ident)
-            if not tail or tail in indexed_tails or ident in indexed:
-                continue
-            if tail in seen:
-                continue
-            seen.add(tail)
-            named.append(ident)
-    for ident in named:
-        if symbol_explicitly_unresolvable(messages, ident):
-            continue
-        if _symbol_origin_succeeded(messages, ident):
-            continue
-        return ident
-    return None
+    return _pending_hop_target(messages)
 
 
 def tools_returned_closing_evidence(messages: list) -> bool:
-    """Bound, guard, or index transform actually present in a tool payload."""
+    """Bounds/snippet/writes evidence present in tool payloads."""
     for m in messages:
         if not isinstance(m, ToolMessage):
             continue
@@ -1039,7 +1259,7 @@ def tools_returned_closing_evidence(messages: list) -> bool:
         if not data:
             continue
         name = getattr(m, "name", None)
-        if name == "get_declaration_bounds":
+        if name == "get_declaration_info":
             size = data.get("array_size")
             if data.get("found") and size not in (None, 0, "0"):
                 return True
@@ -1049,22 +1269,10 @@ def tools_returned_closing_evidence(messages: list) -> bool:
                 for f in nested
             ):
                 return True
-        if name == "get_condition_guards":
-            conds = (
-                data.get("conditions")
-                or data.get("guards")
-                or data.get("guards_found")
-                or []
-            )
-            if conds:
-                return True
-        if name == "get_index_expression_structure" and data.get("operations"):
+        if name == "get_function_snippet" and data.get("snippet"):
             return True
-        for w in _payload_writes(data):
-            if not isinstance(w, dict):
-                continue
-            if _TRANSFORM_RE.search(str(w.get("assigned_expression_text") or "")):
-                return True
+        if name == "get_trimmed_sequence" and _payload_writes(data):
+            return True
     return False
 
 
@@ -1081,7 +1289,7 @@ def select_visible_tool_names(
     pending = pending_named_hop(messages) if next_hop_gate_enabled() else None
     if pending:
         preferred = _HOP_TOOL_NAMES
-    elif "get_affected_symbols" not in used:
+    elif "get_trimmed_sequence" not in used:
         preferred = _SITE_TOOL_NAMES
     elif not _has_useful_index_origin_tool(messages):
         preferred = _ORIGIN_CORE_NAMES
@@ -1122,8 +1330,8 @@ def _build_next_hop_nudge(messages: list) -> str:
     if pending:
         lines.append(f"Required identifier: {pending}")
         lines.append(
-            f"Suggested get_backward_slice(variable_name={pending!r}, "
-            "from_location=<alarm location>)."
+            "Suggested: get_trimmed_sequence(variable=<same operand>) after hop, "
+            "then get_caller_context again only if origin_resolved stays false."
         )
     return "\n".join(lines)
 
@@ -1136,6 +1344,8 @@ def _force_tools_needed(
     if tool_n >= _MAX_TOOL_MESSAGES - 1:
         return False
     if not _has_useful_index_origin_tool(messages):
+        if _origin_progress_stalled(messages):
+            return False
         return True
     if next_hop_gate_enabled() and pending_named_hop(messages):
         return True
@@ -1165,14 +1375,14 @@ def _pack_report_evidence(messages: list) -> str:
         selected.append(msg)
 
     for msg in ordered:
-        if getattr(msg, "name", None) == "get_affected_symbols":
+        if getattr(msg, "name", None) == "get_trimmed_sequence":
             _add(msg)
             break
 
     sticky = _ORIGIN_TOOLS | {
-        "get_condition_guards",
-        "get_declaration_bounds",
-        "get_index_expression_structure",
+        "get_function_snippet",
+        "get_declaration_info",
+        "get_variable_scope",
     }
     for msg in reversed(ordered):
         if getattr(msg, "name", None) in sticky:
@@ -1212,9 +1422,12 @@ def _fill_report_metadata(
         be = {}
     has_origin = _has_useful_index_origin_tool(messages)
     needs_cs = _parameter_path_open(messages)
+    stalled = _origin_progress_stalled(messages)
     completeness = (be.get("evidence_completeness") or "").strip()
     if not has_origin:
         be["evidence_completeness"] = "not traced"
+    elif stalled and completeness in {"", "fully traced"}:
+        be["evidence_completeness"] = "partially traced"
     elif needs_cs:
         if completeness in {"", "fully traced"}:
             be["evidence_completeness"] = "partially traced"
@@ -1223,9 +1436,168 @@ def _fill_report_metadata(
     be.setdefault("symbol", "")
     if "declared_size" not in be:
         be["declared_size"] = None
+    if "target_capacity" not in be:
+        be["target_capacity"] = be.get("declared_size")
+    be.setdefault("index_expression", "")
+    be.setdefault("index_inferred_range", "")
+    be.setdefault("index_safe_range", "")
+    guards = be.get("guards_found")
+    if not isinstance(guards, list):
+        be["guards_found"] = []
     be.setdefault("index_origin_summary", "")
     data["bounds_evidence"] = be
+    # Structured observability for completeness assignment behavior.
+    _log(
+        "[report.completeness] "
+        + json.dumps(
+            {
+                "order_id": order_id,
+                "has_useful_index_origin": has_origin,
+                "parameter_path_open": needs_cs,
+                "saw_parameter_note": _saw_parameter_note(messages),
+                "has_call_site_followup": not _needs_call_site_followup(messages),
+                "origin_progress_stalled": stalled,
+                "input_evidence_completeness": completeness,
+                "computed_evidence_completeness": be.get("evidence_completeness"),
+                "parameter_origin_fully_traced_structurally_reachable": bool(
+                    has_origin
+                    and _saw_parameter_note(messages)
+                    and not needs_cs
+                ),
+            },
+            sort_keys=True,
+        )
+    )
     return data
+
+
+def _latest_non_tool_report_json(messages: list) -> Optional[dict]:
+    """Try to reuse JSON from the latest non-tool AI message before re-prompting."""
+    required_report_keys = {
+        "classification",
+        "comment",
+        "confidence",
+        "summary",
+    }
+    for msg in reversed(messages):
+        if not isinstance(msg, AIMessage):
+            continue
+        if getattr(msg, "tool_calls", None):
+            continue
+        content = getattr(msg, "content", "")
+        if isinstance(content, list):
+            text = "\n".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in content
+            ).strip()
+        else:
+            text = str(content or "").strip()
+        if not text or "{" not in text:
+            continue
+        try:
+            data = _normalize_report_dict(extract_json(text))
+            if str(data.get("type") or "").strip().lower() == "no_tool_call":
+                continue
+            if not any(k in data for k in required_report_keys):
+                continue
+            return data
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _build_sequence_context(store: DataStore, order_id: int) -> str:
+    """Return a compact write-node → alarm-read roadmap to seed the initial prompt."""
+    alarm = store.get_alarm(order_id)
+    if alarm is None:
+        return ""
+    parsed = alarm.parsed_location
+    if not parsed:
+        return ""
+    alarm_line = parsed["line"]
+
+    # Collect DF records within ±2 lines of the alarm.
+    site_records: list = []
+    for ln in range(alarm_line - 2, alarm_line + 3):
+        site_records.extend(store.data_flow_by_line.get(ln, []))
+    if not site_records:
+        return ""
+
+    # Pick primary variable by frequency at the site.
+    var_freq: dict[str, int] = {}
+    for r in site_records:
+        bare = (r.variable or "").split("@", 1)[0].strip('"').strip()
+        if bare:
+            var_freq[bare] = var_freq.get(bare, 0) + 1
+    if not var_freq:
+        return ""
+    primary = max(var_freq, key=var_freq.get)
+
+    # All write events for the primary variable, deduped by (function, line).
+    all_events = store.data_flow_by_variable.get(primary, [])
+    seen_keys: set = set()
+    writes: list = []
+    for r in sorted(all_events, key=lambda r: r.line or 0):
+        if (r.access or "").lower() != "write":
+            continue
+        key = (r.function, r.line)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        writes.append(r)
+
+    lines = [
+        "--- Sequence context (use as navigation map) ---",
+        f"Alarm site (READ node — start here): {alarm.location}",
+        f"Category: {alarm.category or 'Out-of-bound array access'}",
+        f"Primary variable: {primary}",
+    ]
+    if writes:
+        lines.append(f"Write nodes for '{primary}' ({min(len(writes), 8)} shown):")
+        for i, w in enumerate(writes[:8], 1):
+            loc = w.location or f"line {w.line}"
+            lines.append(f"  {i}. {w.function}  @  {loc}")
+    else:
+        lines.append(
+            f"No write nodes indexed for '{primary}' "
+            "— index is likely a function parameter (trace via call sites)."
+        )
+    lines += [
+        "",
+        "Follow navigation strategy: get_function_snippet for index_operands_at_alarm "
+        "→ get_variable_scope/get_declaration_info for that operand → "
+        "get_trimmed_sequence on operand → if origin_resolved=false and scope=parameter "
+        "then get_caller_context and repeat get_trimmed_sequence.",
+        "--- End sequence context ---",
+    ]
+    return "\n".join(lines)
+
+
+def _degraded_report_payload(order_id: int, messages: list, reason: str) -> dict:
+    """Guaranteed schema-shaped fallback when model output is empty/unparseable."""
+    return {
+        "alarm_order_id": order_id,
+        "affected_symbols": [],
+        "function_name": None,
+        "function_snippet": "",
+        "manipulation_sequence": [],
+        "bounds_evidence": {
+            "symbol": "",
+            "declared_size": None,
+            "index_expression": "",
+            "index_inferred_range": "",
+            "index_safe_range": "",
+            "target_capacity": None,
+            "guards_found": [],
+            "index_origin_summary": "",
+            "evidence_completeness": "not traced",
+        },
+        "summary": "Investigation report degraded due to unparseable model output.",
+        "classification": "review",
+        "comment": f"Report synthesis fallback: {reason}",
+        "confidence": "low",
+        "tools_used": sorted(_tool_names_used(messages)),
+    }
 
 
 def _maybe_close_case_reprompt(
@@ -1233,20 +1605,45 @@ def _maybe_close_case_reprompt(
     data: dict,
     messages: list,
     pack: str,
+    *,
+    order_id: int,
 ) -> dict:
     """One extra model turn when the draft hedges past evidence already in tools.
 
     Does not write true/false in Python. If the model still returns review, keep it.
     """
-    if not close_case_reprompt_enabled():
-        return data
+    reprompt_enabled = close_case_reprompt_enabled()
     be = data.get("bounds_evidence")
     completeness = be.get("evidence_completeness") if isinstance(be, dict) else None
-    if data.get("classification") != "review":
+    draft_cls = data.get("classification")
+    closing_evidence_present = tools_returned_closing_evidence(messages)
+    reprompt_trigger_fired = bool(
+        reprompt_enabled
+        and draft_cls == "review"
+        and completeness == "fully traced"
+        and closing_evidence_present
+    )
+    _log(
+        "[report.reprompt_gate] "
+        + json.dumps(
+            {
+                "order_id": order_id,
+                "draft_classification": draft_cls,
+                "computed_evidence_completeness": completeness,
+                "closing_evidence_present": closing_evidence_present,
+                "reprompt_enabled": reprompt_enabled,
+                "reprompt_trigger_fired": reprompt_trigger_fired,
+            },
+            sort_keys=True,
+        )
+    )
+    if not reprompt_enabled:
+        return data
+    if draft_cls != "review":
         return data
     if completeness != "fully traced":
         return data
-    if not tools_returned_closing_evidence(messages):
+    if not closing_evidence_present:
         return data
     _log(
         "[report] fully traced + bound/guard/transform still classified review "
@@ -1309,8 +1706,31 @@ def _maybe_close_case_reprompt(
 
 def build_agent(store: DataStore, model: Optional[str] = None):
     bind_store(store)
-    llm = build_llm(model=model)
+    # Single-model mode: use the same backend/model for tool planning and report.
+    # This avoids planner/report drift and keeps behavior deterministic per run.
+    if model:
+        llm = build_llm(model=model, role="report")
+    else:
+        llm = build_llm(role="report")
     report_llm = llm
+    current_backend = "ollama" if using_ollama() else "nvidia"
+
+    def _try_runtime_fallback(exc: Exception, stage: str) -> bool:
+        nonlocal llm, report_llm, current_backend
+        if current_backend != "ollama":
+            return False
+        if llm_backend_override() == "ollama":
+            return False
+        if not nvidia_configured() or not ollama_runtime_fallback_enabled():
+            return False
+        if not _is_ollama_runtime_error(exc):
+            return False
+        _log(f"[llm] ollama runtime failure during {stage}: {exc}")
+        _log("[llm] switching runtime backend to nvidia for this investigation")
+        llm = build_llm(model=model, backend="nvidia", role="report")
+        report_llm = llm
+        current_backend = "nvidia"
+        return True
 
     def agent_node(state: AgentState) -> dict:
         msgs = list(state["messages"])
@@ -1334,29 +1754,67 @@ def build_agent(store: DataStore, model: Optional[str] = None):
             f"names={[t.name for t in visible]}"
             + (f" next_hop={pending}" if pending else "")
         )
+        response: Optional[AIMessage] = None
         try:
             response = runner.invoke(trimmed)
         except Exception as exc:  # noqa: BLE001
+            if _try_runtime_fallback(exc, "agent tool-planning"):
+                runner = _bind_llm_tools(llm, visible, force=force)
+                response = runner.invoke(trimmed)
             if force:
                 _log(f"[agent] tool_choice=any failed ({exc}); retry unbound")
-                response = _bind_llm_tools(llm, visible, force=False).invoke(trimmed)
+                try:
+                    response = _bind_llm_tools(llm, visible, force=False).invoke(trimmed)
+                except Exception as exc2:  # noqa: BLE001
+                    if _try_runtime_fallback(exc2, "agent unbound retry"):
+                        response = _bind_llm_tools(llm, visible, force=False).invoke(trimmed)
+                    else:
+                        raise
             else:
                 raise
+        if response is None:
+            raise RuntimeError("Agent planning did not produce a response.")
+
         tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
+            response_text = _message_text(response)
+            fallback_calls = _recover_tool_calls_from_text(response_text)
+            if fallback_calls:
+                _log(f"[agent] recovered {len(fallback_calls)} tool call(s) from XML/JSON fallback parser")
+                response = AIMessage(
+                    content=response.content,
+                    tool_calls=fallback_calls,
+                    additional_kwargs=getattr(response, "additional_kwargs", {}) or {},
+                    id=getattr(response, "id", None),
+                )
+                tool_calls = fallback_calls
+            elif _is_offtopic_no_tool_text(response_text):
+                _log("[agent] off-topic no-tool response detected; enforcing strict no_tool_call marker")
+                response = AIMessage(content='{"type":"no_tool_call"}')
+
         _log(f"[agent] tool_calls={len(tool_calls)}")
-        return {"messages": [response]}
+        no_tool_streak = 0 if tool_calls else int(state.get("consecutive_no_tool_calls") or 0) + 1
+        return {
+            "messages": [response],
+            "consecutive_no_tool_calls": no_tool_streak,
+        }
 
     def tools_node(state: AgentState) -> dict:
         result = ToolNode(TOOLS).invoke(state)
         rounds = int(state.get("tool_rounds") or 0) + 1
         _log(f"[tools] completed round={rounds}")
-        return {**result, "tool_rounds": rounds}
+        return {
+            **result,
+            "tool_rounds": rounds,
+            "consecutive_no_tool_calls": 0,
+        }
 
     def nudge_node(state: AgentState) -> dict:
         # Prefer origin → named next-hop → call-site follow-up → guards.
+        dynamic = _build_dynamic_nudge(state["messages"], state["order_id"])
         if not _has_useful_index_origin_tool(state["messages"]):
             n = int(state.get("origin_nudges") or 0) + 1
-            text = _build_origin_nudge(state["messages"])
+            text = dynamic
             _log(f"[nudge] useful index-origin slice required (nudge={n})")
             return {
                 "origin_nudges": n,
@@ -1365,7 +1823,7 @@ def build_agent(store: DataStore, model: Optional[str] = None):
         pending = pending_named_hop(state["messages"]) if next_hop_gate_enabled() else None
         if pending:
             n = int(state.get("next_hop_nudges") or 0) + 1
-            text = _build_next_hop_nudge(state["messages"])
+            text = dynamic + "\n\n" + _build_next_hop_nudge(state["messages"])
             _log(f"[nudge] next-hop identifier {pending!r} required (nudge={n})")
             return {
                 "next_hop_nudges": n,
@@ -1373,19 +1831,29 @@ def build_agent(store: DataStore, model: Optional[str] = None):
             }
         if _needs_call_site_followup(state["messages"]):
             n = int(state.get("call_site_nudges") or 0) + 1
-            text = _build_call_site_nudge(state["messages"])
+            text = dynamic + "\n\n" + _build_call_site_nudge(state["messages"])
             _log(f"[nudge] call-site argument follow-up required (nudge={n})")
             return {
                 "call_site_nudges": n,
                 "messages": [HumanMessage(content=text)],
             }
         n = int(state.get("guard_nudges") or 0) + 1
-        text = _build_guard_nudge(state["messages"])
-        _log(f"[nudge] get_condition_guards required (nudge={n})")
+        text = dynamic + "\n\n" + _build_guard_nudge(state["messages"])
+        _log(f"[nudge] function snippet evidence required (nudge={n})")
         return {
             "guard_nudges": n,
             "messages": [HumanMessage(content=text)],
         }
+
+    def after_nudge(state: AgentState) -> Literal["agent", "report"]:
+        streak = int(state.get("consecutive_no_tool_calls") or 0)
+        if streak >= 2:
+            _log(
+                "[route] consecutive no-tool-call guard tripped after nudge "
+                f"(streak={streak}) -> report"
+            )
+            return "report"
+        return "agent"
 
     def retry_node(state: AgentState) -> dict:
         n = int(state.get("force_retries") or 0) + 1
@@ -1403,6 +1871,22 @@ def build_agent(store: DataStore, model: Optional[str] = None):
         can_nudge = tool_n < _MAX_TOOL_MESSAGES - 1
         force_n = int(state.get("force_retries") or 0)
         msgs = state["messages"]
+        no_tool_streak = int(state.get("consecutive_no_tool_calls") or 0)
+
+        if _any_tool_loop_stalled(msgs):
+            _log("[route] repeated tool-result pattern detected -> report")
+            return "report"
+
+        if no_tool_streak >= 2:
+            _log(
+                "[route] consecutive no-tool-call guard tripped in agent router "
+                f"(streak={no_tool_streak}) -> report"
+            )
+            return "report"
+
+        if oob and _origin_progress_stalled(msgs):
+            _log("[route] origin-tracing stalled with repeated identical tool outputs → report")
+            return "report"
 
         if (
             oob
@@ -1448,7 +1932,7 @@ def build_agent(store: DataStore, model: Optional[str] = None):
             and _guards_missing(msgs)
         ):
             if int(state.get("guard_nudges") or 0) < 1:
-                _log("[route] missing get_condition_guards → nudge")
+                _log("[route] missing get_function_snippet → nudge")
                 return "nudge"
             if force_n < 2:
                 _log("[route] guards still missing after nudge → retry/force")
@@ -1459,12 +1943,18 @@ def build_agent(store: DataStore, model: Optional[str] = None):
         if _count_tool_messages(state["messages"]) >= _MAX_TOOL_MESSAGES:
             _log(f"[route] tool-message ceiling {_MAX_TOOL_MESSAGES} → report")
             return "report"
+        if _any_tool_loop_stalled(state["messages"]):
+            _log("[route] repeated tool-result pattern detected after tools -> report")
+            return "report"
         return "agent"
 
     def report_node(state: AgentState) -> dict:
         _log("[report] building structured JSON report ...")
         pack = _pack_report_evidence(state["messages"])
         used = sorted(_tool_names_used(state["messages"]))
+        data: Optional[dict] = _latest_non_tool_report_json(state["messages"])
+        if data is not None:
+            _log("[report] reusing JSON from latest no-tool AI message")
         human = HumanMessage(
             content=(
                 f"Alarm order id: {state['order_id']}\n"
@@ -1480,26 +1970,54 @@ def build_agent(store: DataStore, model: Optional[str] = None):
             )
         )
 
-        data: Optional[dict] = None
-        try:
-            structured = report_llm.with_structured_output(AlarmInvestigationReport)
-            result = structured.invoke([system, human])
-            if isinstance(result, AlarmInvestigationReport):
-                data = result.model_dump()
-            elif isinstance(result, dict):
-                data = result
-        except Exception as exc:  # noqa: BLE001
-            _log(f"[report] with_structured_output failed ({exc}); JSON extract fallback")
+        if data is None:
+            try:
+                structured = report_llm.with_structured_output(AlarmInvestigationReport)
+                result = structured.invoke([system, human])
+                if isinstance(result, AlarmInvestigationReport):
+                    data = result.model_dump()
+                elif isinstance(result, dict):
+                    data = result
+            except Exception as exc:  # noqa: BLE001
+                if _try_runtime_fallback(exc, "report structured pass"):
+                    try:
+                        structured = report_llm.with_structured_output(AlarmInvestigationReport)
+                        result = structured.invoke([system, human])
+                        if isinstance(result, AlarmInvestigationReport):
+                            data = result.model_dump()
+                        elif isinstance(result, dict):
+                            data = result
+                    except Exception as exc2:  # noqa: BLE001
+                        _log(
+                            "[report] with_structured_output failed after fallback "
+                            f"({exc2}); JSON extract fallback"
+                        )
+                else:
+                    _log(f"[report] with_structured_output failed ({exc}); JSON extract fallback")
 
         if data is None:
-            raw = report_llm.invoke([system, human])
+            try:
+                raw = report_llm.invoke([system, human])
+            except Exception as exc:  # noqa: BLE001
+                if _try_runtime_fallback(exc, "report JSON pass"):
+                    raw = report_llm.invoke([system, human])
+                else:
+                    raise
             content = raw.content if hasattr(raw, "content") else str(raw)
             if isinstance(content, list):
                 content = "\n".join(
                     b.get("text", "") if isinstance(b, dict) else str(b)
                     for b in content
                 )
-            data = extract_json(str(content))
+            try:
+                data = extract_json(str(content))
+            except Exception as exc:  # noqa: BLE001
+                _log(f"[report] JSON extract failed ({exc}); using degraded report")
+                data = _degraded_report_payload(
+                    state["order_id"],
+                    state["messages"],
+                    "final report output was empty or not JSON",
+                )
 
         data["alarm_order_id"] = state["order_id"]
         data = _normalize_report_dict(data)
@@ -1517,6 +2035,17 @@ def build_agent(store: DataStore, model: Optional[str] = None):
                 data["confidence"] = "medium"
                 _log("[report] capped confidence high→medium (no useful index slice)")
 
+        if _origin_progress_stalled(state["messages"]):
+            be = data.get("bounds_evidence")
+            if isinstance(be, dict):
+                if be.get("evidence_completeness") == "fully traced":
+                    be["evidence_completeness"] = "partially traced"
+                elif not be.get("evidence_completeness"):
+                    be["evidence_completeness"] = "not traced"
+            if data.get("confidence") in {"high", "medium"}:
+                data["confidence"] = "low"
+            _log("[report] downgraded confidence/completeness due to stalled origin tracing")
+
         # Parameter path without call-site follow-up: never allow medium/high "true".
         if _parameter_path_open(state["messages"]):
             be = data.get("bounds_evidence")
@@ -1532,12 +2061,12 @@ def build_agent(store: DataStore, model: Optional[str] = None):
                     "(parameter index without call-site follow-up)"
                 )
 
-        # "not traced" must not carry medium/high confidence.
+        # "not traced" must not carry high confidence.
         be = data.get("bounds_evidence")
         if isinstance(be, dict) and be.get("evidence_completeness") == "not traced":
-            if data.get("confidence") in {"medium", "high"}:
-                data["confidence"] = "low"
-                _log("[report] capped confidence → low (evidence not traced)")
+            if data.get("confidence") == "high":
+                data["confidence"] = "medium"
+                _log("[report] capped confidence high→medium (evidence not traced)")
 
         # Incomplete origin is not a false-positive finding.
         be = data.get("bounds_evidence")
@@ -1551,27 +2080,32 @@ def build_agent(store: DataStore, model: Optional[str] = None):
 
         if not data.get("classification"):
             _log("[report] classification missing; requesting repair pass")
-            repair = report_llm.invoke(
-                [
-                    SystemMessage(
-                        content=(
-                            "Return ONLY JSON with keys classification "
-                            '("true", "false", or "review"), comment (short string), '
-                            "and confidence (low|medium|high) based on this "
-                            "draft report and tool evidence. No other keys. "
-                            "Use review when origin is incomplete or the leftover "
-                            "Astrée interval is unexplained. Do not treat Astrée "
-                            "abstract [lo,hi] upper bounds as concrete index values."
-                        )
-                    ),
-                    HumanMessage(
-                        content=(
-                            f"Draft report:\n{json.dumps(data)[:3500]}\n\n"
-                            f"Tool evidence excerpt:\n{pack[:3500]}"
-                        )
-                    ),
-                ]
-            )
+            repair_prompt = [
+                SystemMessage(
+                    content=(
+                        "Return ONLY JSON with keys classification "
+                        '("true", "false", or "review"), comment (short string), '
+                        "and confidence (low|medium|high) based on this "
+                        "draft report and tool evidence. No other keys. "
+                        "Use review when origin is incomplete or the leftover "
+                        "Astrée interval is unexplained. Do not treat Astrée "
+                        "abstract [lo,hi] upper bounds as concrete index values."
+                    )
+                ),
+                HumanMessage(
+                    content=(
+                        f"Draft report:\n{json.dumps(data)[:3500]}\n\n"
+                        f"Tool evidence excerpt:\n{pack[:3500]}"
+                    )
+                ),
+            ]
+            try:
+                repair = report_llm.invoke(repair_prompt)
+            except Exception as exc:  # noqa: BLE001
+                if _try_runtime_fallback(exc, "report repair pass"):
+                    repair = report_llm.invoke(repair_prompt)
+                else:
+                    raise
             repair_text = repair.content if hasattr(repair, "content") else str(repair)
             if isinstance(repair_text, list):
                 repair_text = "\n".join(
@@ -1594,11 +2128,31 @@ def build_agent(store: DataStore, model: Optional[str] = None):
                 _log("[report] false→review after repair (origin not traced)")
 
         data = _maybe_close_case_reprompt(
-            report_llm, data, state["messages"], pack
+            report_llm,
+            data,
+            state["messages"],
+            pack,
+            order_id=state["order_id"],
         )
 
-        report = AlarmInvestigationReport.model_validate(data)
-        return {"report": report.model_dump()}
+        try:
+            report = AlarmInvestigationReport.model_validate(data)
+            return {"report": report.model_dump()}
+        except Exception as exc:  # noqa: BLE001
+            _log(f"[report] model validation failed ({exc}); using degraded report")
+            fallback = _degraded_report_payload(
+                state["order_id"],
+                state["messages"],
+                "report validation failed",
+            )
+            fallback = _fill_report_metadata(
+                _normalize_report_dict(fallback),
+                store,
+                state["order_id"],
+                state["messages"],
+            )
+            report = AlarmInvestigationReport.model_validate(fallback)
+            return {"report": report.model_dump()}
 
     graph = StateGraph(AgentState)
     graph.add_node("agent", agent_node)
@@ -1612,7 +2166,9 @@ def build_agent(store: DataStore, model: Optional[str] = None):
         after_agent,
         {"tools": "tools", "nudge": "nudge", "retry": "retry", "report": "report"},
     )
-    graph.add_edge("nudge", "agent")
+    graph.add_conditional_edges(
+        "nudge", after_nudge, {"agent": "agent", "report": "report"}
+    )
     graph.add_edge("retry", "agent")
     graph.add_conditional_edges(
         "tools", after_tools, {"agent": "agent", "report": "report"}
@@ -1629,6 +2185,8 @@ def json_schema_brief() -> str:
         '"function_name":str|null,"function_snippet":str,'
         '"manipulation_sequence":[{"order":int,"function":str,"access":str,"variable":str,"location":str,"note":str}],'
         '"bounds_evidence":{"symbol":str,"declared_size":int|null,'
+        '"index_expression":str,"index_inferred_range":str,"index_safe_range":str,'
+        '"target_capacity":int|str|null,"guards_found":[str],'
         '"index_origin_summary":str,'
         '"evidence_completeness":"fully traced|partially traced|not traced"}|null,'
         '"summary":str,'
@@ -1688,6 +2246,8 @@ def _normalize_report_dict(data: dict) -> dict:
         out["comment"] = ""
     if "astree_message" not in out or out.get("astree_message") is None:
         out["astree_message"] = ""
+    if "summary" not in out or out.get("summary") is None:
+        out["summary"] = ""
     return out
 
 
@@ -1742,16 +2302,17 @@ def stream_investigate(
     }
     try:
         agent = build_agent(store, model=model)
+        seq_context = _build_sequence_context(store, order_id)
+        initial_human = (
+            f"Investigate Astrée alarm Order id {order_id}.\n\n"
+            + (seq_context + "\n\n" if seq_context else "")
+            + "Follow the navigation strategy in the system prompt. Use tools only."
+        )
         initial = {
             "order_id": order_id,
             "messages": [
                 SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(
-                    content=(
-                        f"Investigate Astrée alarm Order id {order_id}. "
-                        "Use whichever of the five tools you need."
-                    )
-                ),
+                HumanMessage(content=initial_human),
             ],
             "report": None,
             "tool_rounds": 0,
@@ -1760,12 +2321,14 @@ def stream_investigate(
             "guard_nudges": 0,
             "next_hop_nudges": 0,
             "force_retries": 0,
+            "consecutive_no_tool_calls": 0,
         }
         yield {"type": "status", "message": "Agent is deciding which tools to call…"}
         yield {
             "type": "status",
             "message": (
-                f"Calling {llm_backend_label()} now — the first response often "
+                f"Calling {report_backend_label()} now for tool planning and report "
+                "generation (single-model mode) — the first response often "
                 "takes 1–3 minutes; heartbeats will appear while waiting."
             ),
         }
@@ -1783,9 +2346,8 @@ def stream_investigate(
                     yield {
                         "type": "status",
                         "message": (
-                            "Index operand not correctly traced yet — nudging "
-                            "agent to slice index_operand_candidates (not the "
-                            "array / sentinel)."
+                            "Index origin is still incomplete — nudging agent "
+                            "to run trimmed sequence and caller-context steps."
                         ),
                     }
                 elif node_name == "retry":
@@ -1812,7 +2374,12 @@ def stream_investigate(
                         text = _message_text(msg)
                         if not tool_calls:
                             yield {"type": "no_tool_call"}
-                        if text and not tool_calls:
+                        normalized_no_tool = text.replace(" ", "").replace("\n", "")
+                        if text and not tool_calls and normalized_no_tool not in {
+                            '{"type":"no_tool_call"}',
+                            '```json{"type":"no_tool_call"}```',
+                            '```{"type":"no_tool_call"}```',
+                        }:
                             yield {"type": "agent", "content": text}
                         elif text and tool_calls:
                             yield {

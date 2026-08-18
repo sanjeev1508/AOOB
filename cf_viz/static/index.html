@@ -403,6 +403,21 @@
       display: inline-block; width: 0.62rem; height: 0.62rem;
       border-radius: 999px; margin-right: 0.3rem; vertical-align: -1px;
     }
+    .seq-toggle {
+      display: flex; margin-bottom: 0.7rem;
+      border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+      flex-shrink: 0;
+    }
+    .seq-toggle-btn {
+      flex: 1; padding: 0.32rem 0.5rem; border-radius: 0;
+      background: transparent; color: var(--muted); border: 0;
+      font-weight: 500; font-size: 0.74rem; font-family: inherit;
+      cursor: pointer;
+    }
+    .seq-toggle-btn.active {
+      background: rgba(18,181,163,0.15); color: var(--accent);
+    }
+    .seq-toggle-btn:not(:last-child) { border-right: 1px solid var(--line); }
   </style>
 </head>
 <body>
@@ -462,6 +477,10 @@
         <div id="right-meta" class="sub" style="margin-bottom:0.7rem"></div>
         <div class="first-card" id="first-card"></div>
         <div class="mini-stats" id="mini-stats"></div>
+        <div class="seq-toggle" id="seq-toggle">
+          <button class="seq-toggle-btn" data-mode="full" type="button">Full sequence</button>
+          <button class="seq-toggle-btn active" data-mode="writes_only" type="button">Writes + alarm read</button>
+        </div>
         <h2>Following sequence</h2>
         <div class="timeline" id="timeline"></div>
         <div class="alarm-section">
@@ -508,6 +527,7 @@
     let lastHighlight = null;
     let showAllEdges = false;
     let alwaysLabels = false;
+    let seqMode = "writes_only"; // "full" | "writes_only"
     let busy = false;
     let graphReady = false;
 
@@ -691,7 +711,7 @@
       el("mini-stats").innerHTML = "";
     }
 
-    function renderRight(payload) {
+    function renderRight(payload, timelineOverride) {
       el("right-empty").hidden = true;
       el("right-content").hidden = false;
 
@@ -716,13 +736,13 @@
         el("first-card").innerHTML = `<div class="tag">First access</div><div class="meta">No DF events found</div>`;
       }
 
+      const timeline = timelineOverride ?? payload.timeline ?? [];
+      const shownSteps = timeline.length;
       el("mini-stats").innerHTML = `
-        <div class="chip"><b>${counts.timeline_steps ?? 0}</b> steps</div>
+        <div class="chip"><b>${shownSteps}</b> steps</div>
         <div class="chip"><b style="color:var(--read)">${counts.reads ?? 0}</b> reads</div>
         <div class="chip"><b style="color:var(--write)">${counts.writes ?? 0}</b> writes</div>
         <div class="chip"><b style="color:var(--alarm)">${counts.alarms ?? 0}</b> alarms</div>`;
-
-      const timeline = payload.timeline || [];
       el("timeline").innerHTML = timeline.map((step) => {
         const hasAlarm = (step.alarms || []).length > 0;
         const alarmHtml = (step.alarms || []).map((a) => `
@@ -825,6 +845,15 @@
       );
     }
 
+    function _computeWritesOnlyTimeline(payload) {
+      const alarmOrder = payload.alarm?.order;
+      return (payload.timeline || []).filter((step) => {
+        if (step.access_kind === "write" || step.access_kind === "mixed") return true;
+        if ((step.alarms || []).some((a) => a.order === alarmOrder)) return true;
+        return false;
+      }).map((step, i) => ({ ...step, step: i + 1 }));
+    }
+
     function applyHighlight(payload) {
       lastHighlight = payload;
       const seq = payload.function_sequence || [];
@@ -836,12 +865,27 @@
         (payload.alarms_in_sequence || []).map((a) => a.at_function).filter(Boolean)
       );
 
-      el("stat-seq").textContent = String(payload.counts?.timeline_steps ?? seq.length);
-      el("btn-seq-fit").disabled = seq.length === 0;
+      // Writes-only: only write/mixed function nodes + the alarm-site read function.
+      const alarmFn = (payload.alarms_in_sequence || []).find((a) => a.is_query_alarm)?.at_function || null;
+      const writesOnlySet = new Set(
+        seq.filter((id) => {
+          const kind = fnAccess[id] || "other";
+          return kind === "write" || kind === "mixed" || id === alarmFn;
+        })
+      );
+
+      const activeSeqSet = seqMode === "writes_only" ? writesOnlySet : seqSet;
+      const activeSeq = seq.filter((id) => activeSeqSet.has(id));
+      const showBridges = seqMode !== "writes_only";
+
+      el("stat-seq").textContent = String(seqMode === "writes_only"
+        ? activeSeq.length
+        : (payload.counts?.timeline_steps ?? seq.length));
+      el("btn-seq-fit").disabled = activeSeq.length === 0;
 
       graph.forEachNode((id, attrs) => {
-        if (seqSet.has(id)) {
-          const step = seq.indexOf(id) + 1;
+        if (activeSeqSet.has(id)) {
+          const step = activeSeq.indexOf(id) + 1;
           const kind = fnAccess[id] || "other";
           const color = accessColor(kind);
           graph.setNodeAttribute(id, "color", color);
@@ -849,7 +893,7 @@
           graph.setNodeAttribute(id, "label", `${step}. ${id}`);
           graph.setNodeAttribute(id, "forceLabel", true);
           graph.setNodeAttribute(id, "zIndex", 3);
-        } else if (bridges.has(id) || pathNodes.has(id)) {
+        } else if (showBridges && (bridges.has(id) || pathNodes.has(id))) {
           graph.setNodeAttribute(id, "color", C.bridge);
           graph.setNodeAttribute(id, "size", Math.max(5, (attrs.originalSize || 2) * 1.7));
           graph.setNodeAttribute(id, "label", alwaysLabels ? id : "");
@@ -867,7 +911,7 @@
       applyEdgeVisibility();
       if (alwaysLabels) {
         showAllNodeLabels();
-        seq.forEach((id, i) => {
+        activeSeq.forEach((id, i) => {
           if (graph.hasNode(id)) {
             graph.setNodeAttribute(id, "label", `${i + 1}. ${id}`);
             graph.setNodeAttribute(id, "forceLabel", true);
@@ -875,10 +919,12 @@
         });
         renderer.refresh();
       } else {
-        showSequenceLabelsOnly(seqSet);
+        showSequenceLabelsOnly(activeSeqSet);
       }
-      cameraToNodes(seq);
-      renderRight(payload);
+      cameraToNodes(activeSeq);
+
+      const timelineOverride = seqMode === "writes_only" ? _computeWritesOnlyTimeline(payload) : undefined;
+      renderRight(payload, timelineOverride);
 
       const vars = payload.site_variables || [];
       const sel = el("var-select");
@@ -1094,7 +1140,24 @@
       applyHighlight(lastHighlight);
     });
     el("btn-fit").addEventListener("click", () => renderer?.getCamera().animatedReset({ duration: 400 }));
-    el("btn-seq-fit").addEventListener("click", () => cameraToNodes(lastHighlight?.function_sequence || []));
+    el("btn-seq-fit").addEventListener("click", () => {
+      const seq = lastHighlight?.function_sequence || [];
+      const fnAccess = lastHighlight?.function_access || {};
+      const alarmFn = (lastHighlight?.alarms_in_sequence || []).find((a) => a.is_query_alarm)?.at_function || null;
+      const activeSeq = seqMode === "writes_only"
+        ? seq.filter((id) => { const k = fnAccess[id] || "other"; return k === "write" || k === "mixed" || id === alarmFn; })
+        : seq;
+      cameraToNodes(activeSeq);
+    });
+    document.querySelectorAll(".seq-toggle-btn").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        seqMode = btn.dataset.mode;
+        document.querySelectorAll(".seq-toggle-btn").forEach((b) =>
+          b.classList.toggle("active", b === btn)
+        );
+        if (lastHighlight) applyHighlight(lastHighlight);
+      });
+    });
 
     loadGraph().catch((err) => {
       setProgress(0);

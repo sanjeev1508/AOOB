@@ -35,7 +35,30 @@ class BoundsEvidence(BaseModel):
     symbol: str = Field(description="Array / pointer / indexed symbol examined.")
     declared_size: Optional[int] = Field(
         default=None,
-        description="Literal size from get_declaration_bounds when available.",
+        description="Literal size from get_declaration_info when available.",
+    )
+    index_expression: str = Field(
+        default="",
+        description="Index expression text at the alarm site (e.g. idx_a + idx_b).",
+    )
+    index_inferred_range: str = Field(
+        default="",
+        description=(
+            "Agent-inferred runtime range for the traced index expression "
+            "from tool evidence."
+        ),
+    )
+    index_safe_range: str = Field(
+        default="",
+        description="Safe admissible range derived from target capacity/bounds.",
+    )
+    target_capacity: Optional[int | str] = Field(
+        default=None,
+        description="Capacity of indexed target (integer literal or 'Dynamic').",
+    )
+    guards_found: list[str] = Field(
+        default_factory=list,
+        description="Guarding C statements relevant to bounds safety.",
     )
     index_origin_summary: str = Field(
         default="",
@@ -98,6 +121,7 @@ class AlarmInvestigationReport(BaseModel):
         default_factory=list,
         description=(
             "Which tools the agent relied on "
-            "(may include get_declaration_bounds / get_backward_slice)."
+            "(get_variable_scope / get_declaration_info / get_trimmed_sequence / "
+            "get_function_snippet / get_caller_context)."
         ),
     )
