@@ -285,10 +285,18 @@
     }
     .first-card {
       border: 1px solid rgba(251,191,36,0.45);
-      background: linear-gradient(160deg, rgba(251,191,36,0.12), rgba(251,191,36,0.03));
+      background: rgba(251,191,36,0.08);
       border-radius: 12px;
       padding: 0.75rem 0.8rem;
       margin-bottom: 0.9rem;
+    }
+    .first-card.clickable { cursor: pointer; }
+    .first-card.clickable:hover {
+      border-color: rgba(251,191,36,0.85);
+      background: rgba(251,191,36,0.14);
+    }
+    .first-card.clickable:focus-visible {
+      outline: 1px solid rgba(18,181,163,0.7);
     }
     .first-card .tag {
       display: inline-block;
@@ -336,7 +344,9 @@
       gap: 0.45rem;
       padding-bottom: 0.85rem;
     }
-    .tl-item:last-child { padding-bottom: 0.2rem; }
+    .tl-item.clickable { cursor: pointer; border-radius: 10px; }
+    .tl-item.clickable:hover .tl-body { border-color: rgba(18,181,163,0.55); }
+    .tl-item.focused .tl-body { border-color: rgba(251,191,36,0.7); }
     .tl-rail { position: relative; display: flex; justify-content: center; }
     .tl-rail::before {
       content: "";
@@ -430,13 +440,13 @@
         <div class="stats">
           <div class="stat"><b id="stat-nodes">—</b><span>nodes</span></div>
           <div class="stat"><b id="stat-edges">—</b><span>edges</span></div>
-          <div class="stat"><b id="stat-seq">0</b><span>seq</span></div>
+          <div class="stat"><b id="stat-seq">0</b><span>path</span></div>
         </div>
       </div>
 
       <div id="chat-log" aria-live="polite">
         <div class="bubble system">
-          Loading the complete control-flow graph… Then type an Order id (e.g. <span class="mono">39</span>) to investigate.
+          Loading the complete control-flow graph… Then type any Order id from the alarm CSV to investigate.
         </div>
       </div>
 
@@ -452,7 +462,7 @@
           <button id="btn-clear" class="secondary" type="button">Clear graph</button>
         </div>
         <div class="row">
-          <input id="chat-input" type="text" placeholder="Order id, e.g. 39 or investigate 1,112" autocomplete="off" />
+          <input id="chat-input" type="text" placeholder="Order id from Full_alarms.csv" autocomplete="off" />
           <button id="btn-send" type="button">Send</button>
         </div>
         <p class="composer-hint" id="composer-hint">Graph loading…</p>
@@ -464,16 +474,17 @@
       <div id="tooltip" class="mono"></div>
       <div id="hud">
         <button class="secondary" id="btn-fit" type="button">Fit</button>
+        <button class="secondary" id="btn-first" type="button" disabled>Expand first access</button>
         <button class="secondary" id="btn-seq-fit" type="button" disabled>Focus sequence</button>
       </div>
     </section>
 
     <aside class="right" id="right-panel">
       <div id="right-empty" class="empty-right">
-        Run an investigation to highlight the DF sequence: first access, following read/write steps, and alarms on that path.
+        Run an investigation to highlight the compiled index path: origin window, hops toward the alarm, and the alarm access.
       </div>
       <div id="right-content" hidden>
-        <h2 id="right-title">Variable sequence</h2>
+        <h2 id="right-title">Index origin path</h2>
         <div id="right-meta" class="sub" style="margin-bottom:0.7rem"></div>
         <div class="first-card" id="first-card"></div>
         <div class="mini-stats" id="mini-stats"></div>
@@ -490,7 +501,7 @@
       </div>
       <div class="legend">
         <div><i style="background:#38bdf8"></i>Read · <i style="background:#fb923c"></i>Write · <i style="background:#c084fc"></i>Mixed</div>
-        <div><i style="background:#f43f5e"></i>Alarm on sequence · <i style="background:#2a354d"></i>Dimmed CF</div>
+        <div><i style="background:#f43f5e"></i>Alarm on sequence · <i style="background:#5eead4"></i>Expanded neighbor · <i style="background:#2a354d"></i>Dimmed CF</div>
       </div>
     </aside>
   </div>
@@ -513,6 +524,7 @@
       directEdge: "#e2e8f0",
       label: "#e8edf7",
       alarm: "#f43f5e",
+      expand: "#5eead4",
     };
 
     const el = (id) => document.getElementById(id);
@@ -530,6 +542,8 @@
     let seqMode = "writes_only"; // "full" | "writes_only"
     let busy = false;
     let graphReady = false;
+    let expandedNodes = new Set();
+    let focusedNode = null;
 
     function accessColor(kind) {
       if (kind === "read") return C.read;
@@ -649,9 +663,18 @@
         tip.textContent = node;
       });
       renderer.on("leaveNode", () => { tip.style.display = "none"; });
-      renderer.on("clickNode", ({ node }) => {
-        navigator.clipboard?.writeText(node).catch(() => {});
-        appendBubble(`Copied node id: <span class="mono">${esc(node)}</span>`, "status");
+      renderer.on("clickNode", ({ node, event }) => {
+        const orig = event?.original || event?.srcEvent;
+        if (orig && orig.shiftKey) {
+          navigator.clipboard?.writeText(node).catch(() => {});
+          appendBubble(`Copied node id: <span class="mono">${esc(node)}</span>`, "status");
+          return;
+        }
+        if (lastHighlight) {
+          expandFromNode(node);
+        } else {
+          cameraCenterOn(node);
+        }
       });
 
       renderer.getCamera().animatedReset({ duration: 0 });
@@ -660,7 +683,7 @@
       graphReady = true;
       setHint("Enter an Order id and press Send · graph + agent stream together");
       appendBubble(
-        `CF graph ready in ${Math.round(performance.now() - t0)} ms · WebGL. Try <span class="mono">39</span>.`,
+        `CF graph ready in ${Math.round(performance.now() - t0)} ms · WebGL. Enter any Order id.`,
         "status"
       );
     }
@@ -672,13 +695,19 @@
       (lastHighlight?.segments || []).forEach((s) => {
         if (s.kind === "direct") (s.edges || []).forEach((id) => direct.add(id));
       });
-      graph.forEachEdge((id, attrs) => {
+      graph.forEachEdge((id, attrs, src, tgt) => {
+        const isPath = pathEdges.has(id);
+        const isExpand = expandedNodes.has(src) || expandedNodes.has(tgt);
         if (showAllEdges) {
           graph.setEdgeAttribute(id, "hidden", false);
-          if (pathEdges.has(id)) {
+          if (isPath) {
             graph.setEdgeAttribute(id, "color", direct.has(id) ? C.directEdge : C.pathEdge);
             graph.setEdgeAttribute(id, "size", (attrs.originalSize || 1) * 2.2);
             graph.setEdgeAttribute(id, "zIndex", 2);
+          } else if (isExpand) {
+            graph.setEdgeAttribute(id, "color", C.expand);
+            graph.setEdgeAttribute(id, "size", (attrs.originalSize || 1) * 1.6);
+            graph.setEdgeAttribute(id, "zIndex", 1);
           } else if (lastHighlight) {
             graph.setEdgeAttribute(id, "color", "#152033");
             graph.setEdgeAttribute(id, "size", 0.25);
@@ -690,11 +719,16 @@
           }
           return;
         }
-        if (lastHighlight && pathEdges.has(id)) {
+        if (isPath) {
           graph.setEdgeAttribute(id, "hidden", false);
           graph.setEdgeAttribute(id, "color", direct.has(id) ? C.directEdge : C.pathEdge);
           graph.setEdgeAttribute(id, "size", (attrs.originalSize || 1) * 2.4);
           graph.setEdgeAttribute(id, "zIndex", 2);
+        } else if (lastHighlight && isExpand) {
+          graph.setEdgeAttribute(id, "hidden", false);
+          graph.setEdgeAttribute(id, "color", C.expand);
+          graph.setEdgeAttribute(id, "size", (attrs.originalSize || 1) * 1.8);
+          graph.setEdgeAttribute(id, "zIndex", 1);
         } else {
           graph.setEdgeAttribute(id, "hidden", true);
         }
@@ -708,6 +742,8 @@
       el("timeline").innerHTML = "";
       el("alarm-list").innerHTML = "";
       el("first-card").innerHTML = "";
+      el("first-card").onclick = null;
+      el("first-card").classList.remove("clickable");
       el("mini-stats").innerHTML = "";
     }
 
@@ -717,23 +753,37 @@
 
       const alarm = payload.alarm || {};
       const counts = payload.counts || {};
-      el("right-title").textContent = payload.variable || "Variable sequence";
+      el("right-title").textContent =
+        payload.operand_symbol || payload.variable || "Index origin path";
+      const objBits = [
+        payload.indexed_object,
+        payload.object_size != null ? `size ${payload.object_size}` : null,
+        payload.object_dtype || null,
+      ].filter(Boolean).join(" · ");
       el("right-meta").textContent =
-        `From Order ${alarm.order ?? "?"} · ${alarm.category || ""} · ${alarm.location || ""}`;
+        `Order ${alarm.order ?? "?"} · ${payload.index_expression || alarm.category || ""}`
+        + (objBits ? ` · ${objBits}` : "")
+        + (alarm.location ? ` · ${alarm.location}` : "");
 
       const first = payload.first_access;
+      const firstFn = first?.function || "";
       if (first) {
+        el("first-card").classList.toggle("clickable", Boolean(firstFn));
         el("first-card").innerHTML = `
-          <div class="tag">First access</div>
+          <div class="tag">First access · click to expand</div>
           <div class="fn mono">${esc(first.function)}</div>
           <div class="meta">
             <span class="badge ${esc(first.access_kind)}">${esc(first.access_kind)}</span>
             &nbsp;·&nbsp; event #${first.order}
+            ${first.role ? ` · ${esc(first.role)}` : ""}
             <div class="mono" style="margin-top:0.3rem">${esc(first.location)}</div>
-            <div>process: ${esc(first.process || "—")}</div>
+            <div>Click this card or the graph node to reveal callers/callees. Shift-click a node copies its id.</div>
           </div>`;
+        el("first-card").onclick = firstFn ? () => expandFromNode(firstFn) : null;
       } else {
-        el("first-card").innerHTML = `<div class="tag">First access</div><div class="meta">No DF events found</div>`;
+        el("first-card").classList.remove("clickable");
+        el("first-card").onclick = null;
+        el("first-card").innerHTML = `<div class="tag">First access</div><div class="meta">No origin node on this path</div>`;
       }
 
       const timeline = timelineOverride ?? payload.timeline ?? [];
@@ -751,13 +801,13 @@
             <div class="mono">${esc(a.location)}</div>
           </div>`).join("");
         return `
-          <div class="tl-item">
+          <div class="tl-item clickable${step.function === focusedNode ? " focused" : ""}${step.is_first ? " is-first" : ""}" data-fn="${esc(step.function || "")}">
             <div class="tl-rail">
               <div class="tl-dot ${esc(step.access_kind)}${step.is_first ? " first" : ""}"></div>
             </div>
             <div class="tl-body ${hasAlarm ? "has-alarm" : ""}">
               <div class="tl-top">
-                <span class="tl-step">Step ${step.step}${step.count > 1 ? ` · ×${step.count}` : ""}</span>
+                <span class="tl-step">Step ${step.step}${step.count > 1 ? ` · ×${step.count}` : ""}${step.is_first ? " · first access" : ""}</span>
                 <span class="badge ${esc(step.access_kind)}">${esc(step.access_kind)}</span>
               </div>
               <div class="tl-fn mono">${esc(step.function)}</div>
@@ -781,12 +831,22 @@
             </div>
           </div>`).join("")
         : `<div class="empty-right">No alarms found on this variable’s DF locations.</div>`;
+
+      el("timeline").querySelectorAll(".tl-item[data-fn]").forEach((item) => {
+        item.addEventListener("click", () => {
+          const fn = item.getAttribute("data-fn");
+          if (fn) expandFromNode(fn);
+        });
+      });
     }
 
     function clearHighlight() {
       lastHighlight = null;
+      expandedNodes = new Set();
+      focusedNode = null;
       el("stat-seq").textContent = "0";
       el("btn-seq-fit").disabled = true;
+      el("btn-first").disabled = true;
       el("var-select").innerHTML = `<option value="">Variable (auto from DF)</option>`;
       el("var-select").disabled = true;
       clearRight();
@@ -821,8 +881,9 @@
       const graphWidth = (bbox.x[1] - bbox.x[0]) || 1;
       const graphHeight = (bbox.y[1] - bbox.y[0]) || 1;
       const { width, height } = renderer.getDimensions();
-      const groupWidth = (gMaxX - gMinX) || graphWidth;
-      const groupHeight = (gMaxY - gMinY) || graphHeight;
+      const minFrac = ids.length === 1 ? 0.1 : 0.02;
+      const groupWidth = Math.max(gMaxX - gMinX, graphWidth * minFrac);
+      const groupHeight = Math.max(gMaxY - gMinY, graphHeight * minFrac);
       const correction = getCorrectionRatio(
         { width, height },
         { width: graphWidth, height: graphHeight }
@@ -845,17 +906,79 @@
       );
     }
 
-    function _computeWritesOnlyTimeline(payload) {
-      const alarmOrder = payload.alarm?.order;
-      return (payload.timeline || []).filter((step) => {
-        if (step.access_kind === "write" || step.access_kind === "mixed") return true;
-        if ((step.alarms || []).some((a) => a.order === alarmOrder)) return true;
-        return false;
-      }).map((step, i) => ({ ...step, step: i + 1 }));
+    function cameraCenterOn(nodeId) {
+      if (!renderer || !graph || !graph.hasNode(nodeId)) return;
+      const data = renderer.getNodeDisplayData(nodeId);
+      if (!data) {
+        cameraToNodes([nodeId]);
+        return;
+      }
+      renderer.getCamera().animate(
+        { angle: 0, x: data.x, y: data.y, ratio: 0.08 },
+        { duration: 420 }
+      );
     }
 
-    function applyHighlight(payload) {
-      lastHighlight = payload;
+    function neighborhoodOf(id) {
+      const ids = new Set();
+      if (!graph || !graph.hasNode(id)) return ids;
+      ids.add(id);
+      graph.forEachInNeighbor(id, (n) => ids.add(n));
+      graph.forEachOutNeighbor(id, (n) => ids.add(n));
+      return ids;
+    }
+
+    function revealedNeighbors() {
+      const vis = new Set();
+      expandedNodes.forEach((id) => {
+        neighborhoodOf(id).forEach((n) => vis.add(n));
+      });
+      return vis;
+    }
+
+    function activeSequence(payload = lastHighlight) {
+      if (!payload) return [];
+      const seq = payload.function_sequence || [];
+      const fnAccess = payload.function_access || {};
+      const alarmFn = (payload.alarms_in_sequence || []).find((a) => a.is_query_alarm)?.at_function || null;
+      if (seqMode !== "writes_only") return seq;
+      return seq.filter((id) => {
+        const kind = fnAccess[id] || "other";
+        return kind === "write" || kind === "mixed" || id === alarmFn;
+      });
+    }
+
+    function expandFromNode(nodeId) {
+      if (!graph) return;
+      if (!graph.hasNode(nodeId)) {
+        appendBubble(
+          `Not on the CF graph: <span class="mono">${esc(nodeId)}</span> (no caller/callee row for this name).`,
+          "status"
+        );
+        return;
+      }
+      const already = expandedNodes.has(nodeId);
+      expandedNodes.add(nodeId);
+      focusedNode = nodeId;
+      const hop = neighborhoodOf(nodeId);
+      paintHighlight();
+      cameraCenterOn(nodeId);
+      if (lastHighlight) {
+        const timelineOverride = seqMode === "writes_only" ? _computeWritesOnlyTimeline(lastHighlight) : undefined;
+        renderRight(lastHighlight, timelineOverride);
+      }
+      const extra = [...hop].filter((id) => id !== nodeId);
+      if (!already) {
+        appendBubble(
+          `Expanded <span class="mono">${esc(nodeId)}</span> · ${extra.length} neighbor${extra.length === 1 ? "" : "s"}. Click a neighbor to expand further.`,
+          "status"
+        );
+      }
+    }
+
+    function paintHighlight() {
+      const payload = lastHighlight;
+      if (!graph || !payload) return;
       const seq = payload.function_sequence || [];
       const bridges = new Set(payload.bridge_nodes || []);
       const seqSet = new Set(seq);
@@ -864,35 +987,39 @@
       const alarmFns = new Set(
         (payload.alarms_in_sequence || []).map((a) => a.at_function).filter(Boolean)
       );
-
-      // Writes-only: only write/mixed function nodes + the alarm-site read function.
-      const alarmFn = (payload.alarms_in_sequence || []).find((a) => a.is_query_alarm)?.at_function || null;
-      const writesOnlySet = new Set(
-        seq.filter((id) => {
-          const kind = fnAccess[id] || "other";
-          return kind === "write" || kind === "mixed" || id === alarmFn;
-        })
-      );
-
-      const activeSeqSet = seqMode === "writes_only" ? writesOnlySet : seqSet;
-      const activeSeq = seq.filter((id) => activeSeqSet.has(id));
+      const firstFn = payload.first_access?.function || null;
+      const activeSeq = activeSequence(payload);
+      const activeSeqSet = new Set(activeSeq);
       const showBridges = seqMode !== "writes_only";
+      const revealed = revealedNeighbors();
 
       el("stat-seq").textContent = String(seqMode === "writes_only"
         ? activeSeq.length
         : (payload.counts?.timeline_steps ?? seq.length));
       el("btn-seq-fit").disabled = activeSeq.length === 0;
+      el("btn-first").disabled = !firstFn;
 
       graph.forEachNode((id, attrs) => {
         if (activeSeqSet.has(id)) {
           const step = activeSeq.indexOf(id) + 1;
           const kind = fnAccess[id] || "other";
           const color = accessColor(kind);
+          const isFirst = id === firstFn;
+          const isFocus = id === focusedNode;
           graph.setNodeAttribute(id, "color", color);
-          graph.setNodeAttribute(id, "size", Math.max(7, (attrs.originalSize || 2) * (alarmFns.has(id) ? 3.1 : 2.7)));
+          graph.setNodeAttribute(id, "size", Math.max(
+            isFirst || isFocus ? 9 : 7,
+            (attrs.originalSize || 2) * (alarmFns.has(id) ? 3.1 : isFirst ? 3.0 : 2.7)
+          ));
           graph.setNodeAttribute(id, "label", `${step}. ${id}`);
           graph.setNodeAttribute(id, "forceLabel", true);
-          graph.setNodeAttribute(id, "zIndex", 3);
+          graph.setNodeAttribute(id, "zIndex", isFirst || isFocus ? 4 : 3);
+        } else if (revealed.has(id)) {
+          graph.setNodeAttribute(id, "color", C.expand);
+          graph.setNodeAttribute(id, "size", Math.max(5, (attrs.originalSize || 2) * 1.9));
+          graph.setNodeAttribute(id, "label", id);
+          graph.setNodeAttribute(id, "forceLabel", true);
+          graph.setNodeAttribute(id, "zIndex", 2);
         } else if (showBridges && (bridges.has(id) || pathNodes.has(id))) {
           graph.setNodeAttribute(id, "color", C.bridge);
           graph.setNodeAttribute(id, "size", Math.max(5, (attrs.originalSize || 2) * 1.7));
@@ -917,11 +1044,39 @@
             graph.setNodeAttribute(id, "forceLabel", true);
           }
         });
+        revealed.forEach((id) => {
+          if (graph.hasNode(id) && !activeSeqSet.has(id)) {
+            graph.setNodeAttribute(id, "label", id);
+            graph.setNodeAttribute(id, "forceLabel", true);
+          }
+        });
         renderer.refresh();
       } else {
-        showSequenceLabelsOnly(activeSeqSet);
+        const labelSet = new Set([...activeSeqSet, ...revealed]);
+        showSequenceLabelsOnly(labelSet);
       }
-      cameraToNodes(activeSeq);
+    }
+
+    function _computeWritesOnlyTimeline(payload) {
+      const alarmOrder = payload.alarm?.order;
+      return (payload.timeline || []).filter((step) => {
+        if (step.access_kind === "write" || step.access_kind === "mixed") return true;
+        if ((step.alarms || []).some((a) => a.order === alarmOrder)) return true;
+        return false;
+      }).map((step, i) => ({ ...step, step: i + 1 }));
+    }
+
+    function applyHighlight(payload) {
+      lastHighlight = payload;
+      expandedNodes = new Set();
+      focusedNode = payload.first_access?.function || null;
+
+      paintHighlight();
+      if (focusedNode && graph.hasNode(focusedNode)) {
+        cameraCenterOn(focusedNode);
+      } else {
+        cameraToNodes(activeSequence(payload));
+      }
 
       const timelineOverride = seqMode === "writes_only" ? _computeWritesOnlyTimeline(payload) : undefined;
       renderRight(payload, timelineOverride);
@@ -1091,7 +1246,7 @@
       const highlightPromise = runHighlight(orderId)
         .then((data) => {
           appendBubble(
-            `Graph highlighted · ${data.counts?.timeline_steps ?? 0} DF steps · ${data.counts?.alarms ?? 0} alarms on path`,
+            `Graph highlighted · ${data.counts?.path_steps ?? data.counts?.timeline_steps ?? 0} path steps · operand ${data.operand_symbol || data.variable || "?"}`,
             "status"
           );
         })
@@ -1140,14 +1295,12 @@
       applyHighlight(lastHighlight);
     });
     el("btn-fit").addEventListener("click", () => renderer?.getCamera().animatedReset({ duration: 400 }));
+    el("btn-first").addEventListener("click", () => {
+      const firstFn = lastHighlight?.first_access?.function;
+      if (firstFn) expandFromNode(firstFn);
+    });
     el("btn-seq-fit").addEventListener("click", () => {
-      const seq = lastHighlight?.function_sequence || [];
-      const fnAccess = lastHighlight?.function_access || {};
-      const alarmFn = (lastHighlight?.alarms_in_sequence || []).find((a) => a.is_query_alarm)?.at_function || null;
-      const activeSeq = seqMode === "writes_only"
-        ? seq.filter((id) => { const k = fnAccess[id] || "other"; return k === "write" || k === "mixed" || id === alarmFn; })
-        : seq;
-      cameraToNodes(activeSeq);
+      cameraToNodes(activeSequence());
     });
     document.querySelectorAll(".seq-toggle-btn").forEach((btn) => {
       btn.addEventListener("click", () => {

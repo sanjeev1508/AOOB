@@ -51,33 +51,8 @@ _COMMON_INDEX_NAMES = frozenset(
         "id",
         "Id",
         "ch",
-        "ChannelId",
     }
 )
-
-# Simple C integer typedef / builtin widths for abstract-domain FP hints.
-_INT_TYPE_WIDTH_BITS: dict[str, int] = {
-    "uint8": 8,
-    "uint8_t": 8,
-    "uint8_least": 8,
-    "sint8": 8,
-    "int8": 8,
-    "int8_t": 8,
-    "char": 8,
-    "unsigned_char": 8,
-    "uint16": 16,
-    "uint16_t": 16,
-    "uint16_least": 16,
-    "sint16": 16,
-    "int16": 16,
-    "int16_t": 16,
-    "uint32": 32,
-    "uint32_t": 32,
-    "uint32_least": 32,
-    "sint32": 32,
-    "int32": 32,
-    "int32_t": 32,
-}
 
 _ATTR_STRIP_RE = re.compile(r"__attribute__\s*\(\([^)]*\)\)")
 _FUNC_NAME_BLACKLIST = frozenset(
@@ -212,17 +187,38 @@ class DataStore:
     type_array_fields: dict[str, list[DeclarationRecord]] = field(
         default_factory=lambda: defaultdict(list)
     )
+    # Filename prefix taken from alarm Location values (e.g. ALL_bc_with_context.c).
+    source_file_tag: str = "input.c"
 
     @classmethod
     def load(cls, data_dir: Path | str) -> "DataStore":
         data_dir = Path(data_dir)
         store = cls(root=data_dir)
         store._load_alarms(data_dir / "Full_alarms.csv")
+        store._infer_source_file_tag()
         store._load_data_flow(data_dir / "data flow.csv")
         store._load_control_flow(data_dir / "control flow.csv")
         store._load_source(data_dir / "input.c")
         store._build_declaration_index()
         return store
+
+    def _infer_source_file_tag(self) -> None:
+        """Use the source filename from the first parseable alarm Location."""
+        for alarm in self.alarms.values():
+            loc = (alarm.location or "").strip()
+            if ":" not in loc:
+                continue
+            tag = loc.split(":", 1)[0].strip()
+            if tag:
+                self.source_file_tag = tag
+                return
+
+    def synth_location(self, line: int | None, col_end: int | None = None) -> str:
+        """Build a Location-shaped string using this dump's source filename."""
+        if line is None:
+            return ""
+        end = max(1, int(col_end if col_end is not None else 1))
+        return f"{self.source_file_tag}:{int(line)}.1-{end}"
 
     def _read_semicolon_csv(self, path: Path) -> list[dict[str, str]]:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -425,69 +421,6 @@ class DataStore:
             )
         return params
 
-    def resolve_typedef_width(self, type_name: str, *, max_hops: int = 5) -> dict:
-        """Follow simple ``typedef Underlying Name;`` chains for width hints."""
-        key = (type_name or "").strip()
-        if not key:
-            return {"name": key, "found": False}
-        chain = [key]
-        cur = key
-        for _ in range(max(1, max_hops)):
-            width = _INT_TYPE_WIDTH_BITS.get(cur) or _INT_TYPE_WIDTH_BITS.get(
-                cur.replace(" ", "_")
-            )
-            if width is not None:
-                return {
-                    "name": key,
-                    "found": True,
-                    "underlying": cur,
-                    "width_bits": width,
-                    "abstract_max": (1 << width) - 1,
-                    "typedef_chain": chain,
-                    "note": (
-                        f"Type width {width} bits => abstract domain often reports "
-                        f"[0, {(1 << width) - 1}]. That upper bound is the type "
-                        "domain, not proof a runtime index reaches it."
-                    ),
-                }
-            # Scan for typedef Underlying Name;
-            hit = None
-            pat = re.compile(
-                rf"^typedef\s+(.+?)\s+{re.escape(cur)}\s*;\s*$"
-            )
-            for ln in range(1, len(self.source_lines)):
-                text = self.source_lines[ln].strip()
-                m = pat.match(text)
-                if m:
-                    hit = re.sub(r"\s+", " ", m.group(1)).strip()
-                    # Drop storage / qualifiers noise
-                    hit = re.sub(
-                        r"^(?:const|volatile|unsigned|signed)\s+",
-                        "",
-                        hit,
-                    ).strip()
-                    # Keep last token if multi-word custom type left
-                    if " " in hit and hit.split()[-1] not in _INT_TYPE_WIDTH_BITS:
-                        # e.g. "unsigned char" → try full then last
-                        joined = hit.replace(" ", "_")
-                        if joined in _INT_TYPE_WIDTH_BITS:
-                            hit = joined
-                        elif hit.startswith("unsigned char"):
-                            hit = "unsigned_char"
-                        else:
-                            hit = hit.split()[-1]
-                    break
-            if not hit or hit == cur:
-                break
-            chain.append(hit)
-            cur = hit
-        return {
-            "name": key,
-            "found": False,
-            "typedef_chain": chain,
-            "parse_note": "Could not resolve to a known fixed-width integer type.",
-        }
-
     def extract_call_argument_expression(
         self, callee: str, call_line: int, arg_index: int
     ) -> Optional[dict]:
@@ -528,111 +461,36 @@ class DataStore:
                     "call_text": re.sub(r"\s+", " ", blob[m.start() : end + 1])[:280],
                     "approx_line": start,
                 }
-        return None
-
-    def find_call_site_arguments(
-        self,
-        callee_function: str,
-        parameter_name: str,
-        *,
-        from_location: Optional[str] = None,
-        max_sites: int = 12,
-    ) -> dict:
-        """CF callers → argument expressions passed for ``parameter_name``.
-
-        Retrieval only. Use when a sliced symbol is a function parameter with
-        no local writes — the concrete index origin is the caller argument.
-        """
-        callee = (callee_function or "").strip()
-        param = (parameter_name or "").strip().split("@", 1)[0].strip('"')
-        param_tail = param.split(".")[-1]
-        near = self.parse_location_line(from_location) if from_location else None
-        params = self.parse_function_parameters(callee, near_line=near)
-        arg_index = None
-        param_type = None
-        for p in params:
-            if p["name"] == param or p["name"] == param_tail:
-                arg_index = int(p["index"])
-                param_type = p.get("declared_type")
-                break
-        if arg_index is None and params:
-            # Fallback: single-parameter function.
-            if len(params) == 1:
-                arg_index = int(params[0]["index"])
-                param_type = params[0].get("declared_type")
-                param_tail = params[0]["name"]
-
-        width_info = (
-            self.resolve_typedef_width(param_type) if param_type else {"found": False}
-        )
-
-        sites: list[dict] = []
-        edges = list(self.control_by_callee.get(callee, []))
-        seen_loc: set[tuple] = set()
-        for edge in edges:
-            if edge.line is None:
+        # Indirect / function-pointer call: table[i](arg0, arg1, ...)
+        blob = self._window_text(max(1, call_line - 2), call_line + 10)
+        for m in re.finditer(r"\]\s*\(", blob):
+            i = m.end() - 1
+            depth = 0
+            end = None
+            for j in range(i, len(blob)):
+                ch = blob[j]
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = j
+                        break
+            if end is None:
                 continue
-            key = (edge.caller, edge.line)
-            if key in seen_loc:
+            args = self._split_c_args(blob[i + 1 : end])
+            if arg_index >= len(args):
                 continue
-            seen_loc.add(key)
-            extracted = None
-            if arg_index is not None:
-                extracted = self.extract_call_argument_expression(
-                    callee, edge.line, arg_index
-                )
-            site = {
-                "caller": edge.caller,
-                "call_site": edge.call_site,
-                "line": edge.line,
-                "location": (
-                    edge.call_site
-                    or f"ALL_bc_with_context.c:{edge.line}.1-1"
-                ),
+            expr = re.sub(r"\s+", " ", args[arg_index]).strip()
+            idents = [x for x in re.findall(r"\b([A-Za-z_]\w*)\b", expr) if x != fn]
+            return {
+                "argument_expression": expr[:240],
+                "argument_identifiers": idents[:12],
+                "arg_index": arg_index,
+                "call_text": re.sub(r"\s+", " ", blob[max(0, m.start() - 40) : end + 1])[:280],
+                "approx_line": call_line,
             }
-            if extracted:
-                site.update(extracted)
-            sites.append(site)
-            if len(sites) >= max_sites:
-                break
-
-        # Collect unique next-slice candidates from argument identifiers.
-        next_syms: list[str] = []
-        seen_s: set[str] = set()
-        for s in sites:
-            for ident in s.get("argument_identifiers") or []:
-                if ident in _COMMON_INDEX_NAMES and ident == param_tail:
-                    continue
-                if ident in seen_s:
-                    continue
-                # Skip type-like tokens.
-                if ident.endswith(("Type", "Idx", "IterType")) and ident[0].isupper():
-                    if ident not in {param_tail}:
-                        # still allow ethBufDataIdx-style names ending in Idx
-                        if not ident[0].islower() and "Idx" in ident and len(ident) < 8:
-                            continue
-                seen_s.add(ident)
-                next_syms.append(ident)
-
-        return {
-            "callee": callee,
-            "parameter_name": param_tail,
-            "parameter_index": arg_index,
-            "parameter_type": param_type,
-            "parameter_type_width": width_info if width_info.get("found") else None,
-            "parameters_parsed": params,
-            "call_sites": sites,
-            "next_slice_candidates": next_syms[:16],
-            "truncated": len(edges) > len(sites),
-            "note": (
-                "Raw retrieval of caller argument expressions for a callee "
-                "parameter. Empty local writes on a parameter are expected — "
-                "continue investigation on next_slice_candidates / "
-                "argument_identifiers (not the parameter name alone). "
-                "parameter_type_width.abstract_max matching an Astrée [0, hi] "
-                "often means type-domain over-approx, not a proven runtime index."
-            ),
-        }
+        return None
 
     def _function_end_from(self, func_line: int, max_span: int = 1200) -> int:
         """Brace-match from a candidate function start line; return end line."""
@@ -657,8 +515,11 @@ class DataStore:
             return None
         text = self.source_lines[line_no].strip()
         if not text or text.startswith(
-            ("if", "for", "while", "switch", "else", "case", "#", "}")
+            ("if", "for", "while", "switch", "else", "case", "#", "}", "(", "return")
         ):
+            return None
+        # Cast-call `(void)Foo(` and other statements are not definitions.
+        if text.startswith("(void)") or re.match(r"^\(\s*void\s*\)", text):
             return None
 
         # Strip GNU attributes so they are not mistaken for the function name.
@@ -684,15 +545,39 @@ class DataStore:
                 name = cm.group(1)
                 if name in _FUNC_NAME_BLACKLIST:
                     continue
-                # Skip obvious type tokens when a better name follows earlier —
-                # already iterating rightmost-first.
                 if name.endswith(("Type", "type", "Idx", "IterType")) and len(
                     candidates
                 ) > 1:
-                    # Likely return type fragment; keep looking left only if
-                    # this is the only candidate.
                     continue
-                return name
+                # Require a body `{` after the parameter list (same or following lines).
+                # Otherwise this is a call site, not a definition.
+                after = cleaned[cm.end() :].lstrip()
+                if after.startswith("{") or after.startswith(";"):
+                    if after.startswith(";"):
+                        return None
+                    return name
+                saw_body = False
+                for j in range(line_no + 1, min(line_no + 16, len(self.source_lines))):
+                    nxt = self.source_lines[j].strip()
+                    if not nxt:
+                        continue
+                    if nxt.startswith("{"):
+                        saw_body = True
+                        break
+                    if nxt.startswith(";"):
+                        return None
+                    if nxt.startswith(")") or nxt.endswith(")"):
+                        continue
+                    if nxt.endswith("{") or "{" in nxt:
+                        saw_body = True
+                        break
+                    # Parameter continuation; keep scanning.
+                    if nxt.startswith(",") or re.match(r"^[\w\s\*]+[,)]?$", nxt):
+                        continue
+                    break
+                if saw_body:
+                    return name
+            return None
 
         # Multi-line: Name\n( ... )\n{
         if re.fullmatch(r"[A-Za-z_]\w*", cleaned) or re.fullmatch(
@@ -829,7 +714,7 @@ class DataStore:
                 elif size_tok:
                     declared_type = f"{declared_type}[{size_tok}]".strip()
 
-                loc = f"ALL_bc_with_context.c:{line_no}.1-{max(1, len(raw))}"
+                loc = self.synth_location(line_no, max(1, len(raw)))
                 rec = DeclarationRecord(
                     name=name,
                     raw_declaration_text=text[:240],
@@ -885,7 +770,7 @@ class DataStore:
                     )
                 ):
                     continue
-                loc = f"ALL_bc_with_context.c:{line_no}.1-{max(1, len(raw))}"
+                loc = self.synth_location(line_no, max(1, len(raw)))
                 rec = DeclarationRecord(
                     name=name,
                     raw_declaration_text=text[:240],
@@ -951,9 +836,8 @@ class DataStore:
                                 else f"{left_n}[?]"
                             ),
                             is_pointer="*" in left,
-                            location=(
-                                f"ALL_bc_with_context.c:{fln}.1-"
-                                f"{max(1, len(self.source_lines[fln]))}"
+                            location=self.synth_location(
+                                fln, max(1, len(self.source_lines[fln]))
                             ),
                             parse_note=(
                                 None
@@ -1149,33 +1033,6 @@ class DataStore:
         parent = full.rsplit(".", 1)[0] if "." in full else None
         return {"full": full, "tail": tail, "parent": parent}
 
-    def declaration_name_suggestions(self, symbol_name: str, limit: int = 8) -> list[str]:
-        """Structural near-matches for a missing declaration name (retrieval aid)."""
-        key = (symbol_name or "").strip().split("@", 1)[0].strip('"')
-        if len(key) < 6:
-            return []
-        key_l = key.lower()
-        scored: list[tuple[int, str]] = []
-        for name in self.declarations:
-            n_l = name.lower()
-            if key_l == n_l:
-                continue
-            score = 0
-            if len(key_l) >= 8 and (key_l in n_l or n_l in key_l):
-                score = 3
-            else:
-                pref = 0
-                for a, b in zip(key_l, n_l):
-                    if a != b:
-                        break
-                    pref += 1
-                if pref >= max(10, len(key_l) // 2):
-                    score = 1
-            if score:
-                scored.append((score, name))
-        scored.sort(key=lambda t: (-t[0], t[1]))
-        return [n for _, n in scored[:limit]]
-
     def get_prior_writes(
         self,
         variable_name: str,
@@ -1276,47 +1133,6 @@ class DataStore:
         out.sort(key=lambda r: (r.line or 0, r.function, r.location))
         return out
 
-    def df_lookup_stats(self, variable_name: str, before_location: str) -> dict:
-        """Explain how a variable name resolved in the DF index (retrieval only)."""
-        bare = (variable_name or "").strip().split("@", 1)[0].strip('"')
-        before_line = self.parse_location_line(before_location)
-        keys = sorted(
-            {k for k in self.data_flow_by_variable if k == bare or k.startswith(bare + "@")}
-        )
-        records: list[DataFlowRecord] = []
-        seen: set[tuple] = set()
-        for key in keys:
-            for rec in self.data_flow_by_variable.get(key, []):
-                sig = (rec.variable, rec.function, rec.location, rec.line, rec.process, rec.access)
-                if sig in seen:
-                    continue
-                seen.add(sig)
-                records.append(rec)
-        writes = [r for r in records if (r.access or "").lower() == "write"]
-        before = [
-            r for r in writes if before_line is not None and r.line is not None and r.line < before_line
-        ]
-        after = [
-            r for r in writes if before_line is not None and r.line is not None and r.line >= before_line
-        ]
-        return {
-            "queried_name": bare,
-            "df_keys_matched": keys,
-            "df_record_count": len(records),
-            "df_write_count": len(writes),
-            "writes_before_location": len(before),
-            "writes_at_or_after_location": len(after),
-            "sample_writes_at_or_after": [
-                {
-                    "variable": r.variable,
-                    "function": r.function,
-                    "line": r.line,
-                    "location": r.location,
-                }
-                for r in after[:5]
-            ],
-        }
-
     def extract_assignment_text(self, line: int, variable_name: str) -> str:
         """Return source text mentioning an assignment involving ``variable_name``."""
         if line < 1 or line >= len(self.source_lines):
@@ -1400,7 +1216,9 @@ class DataStore:
                 hits.append(
                     {
                         "function": None,  # filled by caller
-                        "location": f"ALL_bc_with_context.c:{ln}.1-{max(1, len(self.source_lines[ln]))}",
+                        "location": self.synth_location(
+                            ln, max(1, len(self.source_lines[ln]))
+                        ),
                         "line": ln,
                         "process": None,
                         "assigned_expression_text": text[:300],
@@ -1455,7 +1273,7 @@ class DataStore:
 
         hits: list[dict] = []
         hi = min(before_line - 1, len(self.source_lines) - 1)
-        for ln in range(1, hi + 1):
+        for ln in range(hi, 0, -1):
             text = self.source_lines[ln].strip()
             if not text or tail not in text:
                 continue
@@ -1465,9 +1283,8 @@ class DataStore:
             hits.append(
                 {
                     "function": fn,
-                    "location": (
-                        f"ALL_bc_with_context.c:{ln}.1-"
-                        f"{max(1, len(self.source_lines[ln]))}"
+                    "location": self.synth_location(
+                        ln, max(1, len(self.source_lines[ln]))
                     ),
                     "line": ln,
                     "process": None,
@@ -1478,541 +1295,8 @@ class DataStore:
             )
             if len(hits) >= max_hits:
                 break
+        hits.reverse()
         return hits
-
-    def backward_slice(
-        self,
-        variable_name: str,
-        from_location: str,
-        *,
-        max_depth: int = 8,
-        max_writes: int = 80,
-    ) -> dict:
-        """Structural backward walk over DF writes + same-function source assigns + CF callers.
-
-        Returns writes found, unresolved graph-boundary paths, and whether the
-        walk stopped due to depth / write-count limits. No safety verdict.
-
-        For each CF caller frame, writes are filtered against that caller's
-        call-site location (not only the original alarm line), so functions that
-        appear later in the preprocessed file are still searchable.
-        """
-        bare = (variable_name or "").strip().split("@", 1)[0].strip('"')
-        lookup = self.df_lookup_stats(bare, from_location)
-        target_line = self.parse_location_line(from_location)
-        if target_line is None:
-            return {
-                "variable": bare,
-                "target_location": from_location,
-                "writes_found": [],
-                "unresolved_paths": [
-                    {
-                        "reason": "could not parse from_location line number",
-                        "function": None,
-                        "location": from_location,
-                    }
-                ],
-                "truncated": False,
-                "lookup": lookup,
-            }
-
-        start_fn, fn_start, fn_end = self.find_enclosing_function(target_line)
-        # Queue items: (fn, depth, f_start, f_end, before_location)
-        queue: list[
-            tuple[Optional[str], int, Optional[int], Optional[int], str]
-        ] = [(start_fn, 0, fn_start, fn_end, from_location)]
-        seen_fns: set[Optional[str]] = set()
-        writes_found: list[dict] = []
-        unresolved: list[dict] = []
-        truncated = False
-        seen_write_keys: set[tuple] = set()
-
-        while queue:
-            fn, depth, f_start, f_end, before_loc = queue.pop(0)
-            if fn in seen_fns:
-                continue
-            seen_fns.add(fn)
-            if depth > max_depth:
-                truncated = True
-                unresolved.append(
-                    {
-                        "reason": "max_depth reached before exploring further callers",
-                        "function": fn,
-                        "location": before_loc,
-                    }
-                )
-                continue
-
-            if fn:
-                candidates = self.get_prior_writes(
-                    bare, before_loc, function_scope=fn
-                )
-            else:
-                candidates = self.get_prior_writes(bare, before_loc)
-
-            for rec in candidates:
-                key = ("df", rec.function, rec.location, rec.line, rec.process)
-                if key in seen_write_keys:
-                    continue
-                seen_write_keys.add(key)
-                expr = (
-                    self.extract_assignment_text(rec.line, bare)
-                    if rec.line is not None
-                    else ""
-                )
-                writes_found.append(
-                    {
-                        "function": rec.function,
-                        "location": rec.location,
-                        "line": rec.line,
-                        "process": rec.process,
-                        "assigned_expression_text": expr,
-                        "call_depth": depth,
-                        "source": "data_flow",
-                        "before_location_used": before_loc,
-                    }
-                )
-                if len(writes_found) >= max_writes:
-                    truncated = True
-                    break
-
-            # Same-function source scan (catches local / field assigns missing from DF).
-            if (
-                not truncated
-                and f_start is not None
-                and f_end is not None
-            ):
-                before_line = self.parse_location_line(before_loc) or target_line
-                for hit in self.find_source_assignments(
-                    bare,
-                    before_line=before_line,
-                    function_start=f_start,
-                    function_end=f_end,
-                ):
-                    key = ("src", hit["location"], hit["line"])
-                    if key in seen_write_keys:
-                        continue
-                    seen_write_keys.add(key)
-                    hit = dict(hit)
-                    hit["function"] = fn
-                    hit["call_depth"] = depth
-                    hit["before_location_used"] = before_loc
-                    writes_found.append(hit)
-                    if len(writes_found) >= max_writes:
-                        truncated = True
-                        break
-
-            if truncated and len(writes_found) >= max_writes:
-                break
-
-            if fn and depth < max_depth:
-                callers = self.control_by_callee.get(fn, [])
-                if not callers:
-                    unresolved.append(
-                        {
-                            "reason": (
-                                "reached function with no visible caller in "
-                                "control-flow graph"
-                            ),
-                            "function": fn,
-                            "location": before_loc,
-                        }
-                    )
-                else:
-                    for edge in callers:
-                        if edge.caller and edge.caller not in seen_fns:
-                            c_start = c_end = None
-                            if edge.line is not None:
-                                c_fn, c_start, c_end = self.find_enclosing_function(
-                                    edge.line
-                                )
-                                if c_fn != edge.caller:
-                                    c_start = c_end = None
-                            # Filter caller writes relative to this call site.
-                            caller_before = edge.call_site or before_loc
-                            queue.append(
-                                (edge.caller, depth + 1, c_start, c_end, caller_before)
-                            )
-            elif fn and depth >= max_depth:
-                truncated = True
-                callers = self.control_by_callee.get(fn, [])
-                if not callers:
-                    unresolved.append(
-                        {
-                            "reason": (
-                                "reached function with no visible caller in "
-                                "control-flow graph"
-                            ),
-                            "function": fn,
-                            "location": before_loc,
-                        }
-                    )
-                else:
-                    unresolved.append(
-                        {
-                            "reason": "max_depth reached with callers remaining unexplored",
-                            "function": fn,
-                            "location": before_loc,
-                        }
-                    )
-
-        uniq: list[dict] = []
-        seen_u: set[tuple] = set()
-        for u in unresolved:
-            k = (u.get("reason"), u.get("function"))
-            if k in seen_u:
-                continue
-            seen_u.add(k)
-            uniq.append(u)
-
-        writes_found.sort(
-            key=lambda w: (
-                w.get("call_depth", 0) if w.get("call_depth") is not None else 99,
-                w.get("line") or 0,
-                w.get("function") or "",
-            )
-        )
-
-        # When DF has no field-level keys (common for Struct.Field), supplement
-        # with a capped file-wide source scan so the agent still sees writes.
-        # Skipped for generic names (Index, i, …) — those must stay path-local.
-        if len(writes_found) < 3 and target_line is not None:
-            for hit in self.find_source_assignments_global(
-                bare, before_line=target_line, max_hits=max_writes
-            ):
-                key = ("srcg", hit["location"], hit["line"])
-                if key in seen_write_keys:
-                    continue
-                if any(w.get("line") == hit.get("line") for w in writes_found):
-                    continue
-                seen_write_keys.add(key)
-                writes_found.append(hit)
-                if len(writes_found) >= max_writes:
-                    truncated = True
-                    break
-            writes_found.sort(
-                key=lambda w: (
-                    w.get("call_depth", 0) if w.get("call_depth") is not None else 99,
-                    w.get("line") or 0,
-                    w.get("function") or "",
-                )
-            )
-
-        # Parameter note: name appears in the enclosing function signature.
-        param_note = None
-        call_site_info = None
-        if start_fn and fn_start and not writes_found:
-            header = " ".join(
-                self.source_lines[ln].strip()
-                for ln in range(fn_start, min(fn_start + 5, len(self.source_lines)))
-            )
-            if re.search(rf"\b{re.escape(bare.split('.')[-1])}\b", header):
-                param_note = (
-                    f"{bare.split('.')[-1]!r} appears in the signature of "
-                    f"{start_fn} (likely a parameter). No prior writes found in "
-                    "this function — origin is at call sites, not a local loop "
-                    "in an unrelated function."
-                )
-                call_site_info = self.find_call_site_arguments(
-                    start_fn,
-                    bare,
-                    from_location=from_location,
-                    max_sites=10,
-                )
-
-        result = {
-            "variable": bare,
-            "target_location": from_location,
-            "start_function": start_fn,
-            "writes_found": writes_found,
-            "unresolved_paths": uniq,
-            "truncated": truncated,
-            "functions_visited": [f for f in seen_fns if f],
-            "lookup": lookup,
-        }
-        if param_note:
-            result["parameter_note"] = param_note
-        if call_site_info is not None:
-            result["call_site_arguments"] = call_site_info
-            result["navigation_hint"] = (
-                "Parameter with no local writes. Use call_site_arguments."
-                "next_slice_candidates (argument expressions at callers) as the "
-                "next get_backward_slice / get_condition_guards targets. Do not "
-                "treat empty writes_found as proof of OOB; do not treat an Astrée "
-                "[0, type_max] vs small array alone as classification true."
-            )
-        return result
-
-    def get_all_writes_to_symbol(self, symbol_name: str, *, max_writes: int = 120) -> dict:
-        """Flat DF write listing for a symbol (no path / depth filter).
-
-        Retrieval only — reachability to an alarm site is NOT implied.
-        For Struct.Field names with no DF keys, supplements with a capped
-        source scan of field assignments.
-        """
-        forms = self._symbol_name_forms(symbol_name)
-        bare = forms["full"] or ""
-        tail = forms["tail"] or bare
-        keys = sorted(
-            {
-                k
-                for k in self.data_flow_by_variable
-                if k == bare
-                or k.startswith(bare + "@")
-                or (tail and (k == tail or k.startswith(tail + "@")))
-                or (
-                    forms["parent"]
-                    and (k == forms["parent"] or k.startswith(forms["parent"] + "@"))
-                )
-            }
-        )
-        writes: list[dict] = []
-        seen: set[tuple] = set()
-        for key in keys:
-            for rec in self.data_flow_by_variable.get(key, []):
-                if (rec.access or "").lower() != "write":
-                    continue
-                # Parent aggregate keys: keep only lines that mention the field.
-                if forms["parent"] and key.startswith(forms["parent"]):
-                    line_txt = (
-                        self.source_lines[rec.line]
-                        if rec.line and rec.line < len(self.source_lines)
-                        else ""
-                    )
-                    if tail and tail not in line_txt:
-                        continue
-                sig = (rec.variable, rec.function, rec.location, rec.line, rec.process)
-                if sig in seen:
-                    continue
-                seen.add(sig)
-                writes.append(
-                    {
-                        "variable": rec.variable,
-                        "function": rec.function,
-                        "location": rec.location,
-                        "line": rec.line,
-                        "process": rec.process,
-                        "assigned_expression_text": self.extract_assignment_text(
-                            rec.line or 0, tail or bare
-                        )
-                        if rec.line
-                        else "",
-                        "source": "data_flow",
-                    }
-                )
-        # Source supplement when DF is empty / sparse for fields.
-        if len(writes) < 5:
-            for hit in self.find_source_assignments_global(
-                bare or tail,
-                before_line=len(self.source_lines),
-                max_hits=max_writes,
-            ):
-                sig = ("src", hit.get("location"), hit.get("line"))
-                if sig in seen:
-                    continue
-                if any(w.get("line") == hit.get("line") for w in writes):
-                    continue
-                seen.add(sig)
-                writes.append(hit)
-        writes.sort(key=lambda w: (w.get("line") or 0, w.get("function") or ""))
-        truncated = len(writes) > max_writes
-        return {
-            "symbol": bare,
-            "df_keys_matched": keys,
-            "write_count": len(writes),
-            "writes": writes[:max_writes],
-            "truncated": truncated,
-        }
-
-    def resolve_symbolic_constant(self, name: str) -> dict:
-        """Look up a #define or enum member literal value in input.c.
-
-        Retrieval only — no guessing for macros/expressions that are not plain
-        integer literals. Sequential enum members without ``=`` get their
-        C ordinal (0, 1, 2, …) when the enclosing enum block can be parsed.
-        """
-        key = (name or "").strip().split("@", 1)[0].strip('"')
-        if not key or not re.match(r"^[A-Za-z_]\w*$", key):
-            return {
-                "name": key,
-                "found": False,
-                "parse_note": "Name must be a bare C identifier.",
-            }
-
-        # 1) #define NAME literal
-        define_re = re.compile(
-            rf"^\s*#\s*define\s+{re.escape(key)}\s+(.+)$"
-        )
-        for ln in range(1, len(self.source_lines)):
-            text = self.source_lines[ln]
-            m = define_re.match(text)
-            if not m:
-                continue
-            rhs = m.group(1).strip()
-            # Strip trailing line comments
-            rhs = re.split(r"\s+//|\s+/\*", rhs, maxsplit=1)[0].strip()
-            lit = self._parse_int_literal(rhs)
-            if lit is not None:
-                return {
-                    "name": key,
-                    "found": True,
-                    "kind": "define",
-                    "value": lit["value"],
-                    "value_text": lit["text"],
-                    "location": f"ALL_bc_with_context.c:{ln}.1-{max(1, len(text))}",
-                    "raw_text": text.strip()[:240],
-                    "parse_note": None,
-                }
-            return {
-                "name": key,
-                "found": True,
-                "kind": "define",
-                "value": None,
-                "value_text": rhs[:120],
-                "location": f"ALL_bc_with_context.c:{ln}.1-{max(1, len(text))}",
-                "raw_text": text.strip()[:240],
-                "parse_note": (
-                    "Found #define but RHS is not a plain integer literal "
-                    "(macro/expression) — value left unresolved."
-                ),
-            }
-
-        # 2) Enum member (explicit = or sequential ordinal)
-        word_re = re.compile(rf"\b{re.escape(key)}\b")
-        for ln in range(1, len(self.source_lines)):
-            text = self.source_lines[ln]
-            if not word_re.search(text):
-                continue
-            # Prefer lines that look like enum member lists / assignments.
-            if "enum" not in text and "=" not in text and "," not in text:
-                # Could still be inside a multi-line enum — check nearby header.
-                if not self._line_inside_enum(ln):
-                    continue
-            enum_info = self._resolve_enum_member_at_line(key, ln)
-            if enum_info is not None:
-                return enum_info
-
-        return {
-            "name": key,
-            "found": False,
-            "parse_note": (
-                "No #define or enum member with this exact name found in input.c."
-            ),
-            "name_suggestions": self.declaration_name_suggestions(key),
-        }
-
-    @staticmethod
-    def _parse_int_literal(text: str) -> Optional[dict]:
-        t = (text or "").strip()
-        if not t:
-            return None
-        # Unwrap one layer of parentheses: (5u)
-        if t.startswith("(") and t.endswith(")"):
-            t = t[1:-1].strip()
-        m = re.fullmatch(
-            r"([+\-]?(?:0[xX][0-9A-Fa-f]+|\d+))(?:[uUlL]{0,3})",
-            t,
-        )
-        if not m:
-            return None
-        raw = m.group(1)
-        try:
-            val = int(raw, 0)
-        except ValueError:
-            return None
-        return {"value": val, "text": t}
-
-    def _line_inside_enum(self, line: int) -> bool:
-        lo = max(1, line - 40)
-        for ln in range(line, lo - 1, -1):
-            t = self.source_lines[ln]
-            if re.search(r"\benum\b", t):
-                return True
-            if "}" in t and "enum" not in t:
-                return False
-        return False
-
-    def _resolve_enum_member_at_line(self, key: str, hit_line: int) -> Optional[dict]:
-        # Scan upward for enum / typedef enum opener.
-        start = None
-        for ln in range(hit_line, max(0, hit_line - 80), -1):
-            t = self.source_lines[ln]
-            if re.search(r"\benum\b", t):
-                start = ln
-                break
-            if ln < hit_line and re.match(r"^\s*}\s*\w*\s*;", t):
-                return None
-        if start is None:
-            return None
-
-        # Collect body until closing brace.
-        body_parts: list[str] = []
-        end_line = start
-        for ln in range(start, min(len(self.source_lines), start + 120)):
-            body_parts.append(self.source_lines[ln])
-            end_line = ln
-            # Stop after enum's closing `};` (not the opening line alone).
-            if ln > start and "}" in self.source_lines[ln]:
-                break
-        body = " ".join(body_parts)
-        # Members: IDENT or IDENT = expr, separated by commas.
-        # Strip comments roughly.
-        body = re.sub(r"/\*.*?\*/", " ", body)
-        body = re.sub(r"//.*?$", " ", body, flags=re.M)
-        # Focus between { and }
-        brace = re.search(r"\{(.*)\}", body, flags=re.S)
-        if not brace:
-            return None
-        inner = brace.group(1)
-        members: list[tuple[str, Optional[int], Optional[str]]] = []
-        next_val = 0
-        for part in inner.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            m = re.match(
-                r"([A-Za-z_]\w*)\s*(?:=\s*([^,\s][^,]*))?",
-                part,
-            )
-            if not m:
-                continue
-            name = m.group(1)
-            rhs = (m.group(2) or "").strip() or None
-            if rhs:
-                lit = self._parse_int_literal(rhs)
-                if lit is None:
-                    members.append((name, None, rhs))
-                    # Cannot continue auto-numbering reliably.
-                    next_val = None  # type: ignore[assignment]
-                else:
-                    members.append((name, lit["value"], lit["text"]))
-                    next_val = lit["value"] + 1
-            else:
-                if next_val is None:
-                    members.append((name, None, None))
-                else:
-                    members.append((name, next_val, str(next_val)))
-                    next_val += 1
-
-        for name, value, value_text in members:
-            if name != key:
-                continue
-            return {
-                "name": key,
-                "found": True,
-                "kind": "enum_member",
-                "value": value,
-                "value_text": value_text,
-                "enum_location": f"ALL_bc_with_context.c:{start}.1-{end_line}",
-                "enum_member_count": len(members),
-                "raw_text": self.source_lines[hit_line].strip()[:240],
-                "parse_note": (
-                    None
-                    if value is not None
-                    else "Enum member found but value could not be resolved to a literal."
-                ),
-            }
-        return None
 
     def find_condition_guards(
         self,
@@ -2024,7 +1308,7 @@ class DataStore:
     ) -> dict:
         """Find if/switch/assert/ternary conditions mentioning ``variable_name``.
 
-        Walks the same CF caller climb idea as backward_slice, scanning source
+        Walks CF callers, scanning source
         in each visited function for conditional text before ``from_location``
         (or before each call-site location). Retrieval only — does not judge
         whether a guard prevents the access.
@@ -2085,7 +1369,7 @@ class DataStore:
                         c_start,
                         c_end,
                         edge.call_site
-                        or f"ALL_bc_with_context.c:{c_line}.1-1",
+                        or self.synth_location(c_line),
                     )
                 )
 
@@ -2183,9 +1467,8 @@ class DataStore:
                     "condition_text": cond,
                     "kind": kind,
                     "function": function,
-                    "location": (
-                        f"ALL_bc_with_context.c:{start_line}.1-"
-                        f"{max(1, len(self.source_lines[start_line]))}"
+                    "location": self.synth_location(
+                        start_line, max(1, len(self.source_lines[start_line]))
                     ),
                     "line": start_line,
                     "call_depth": call_depth,

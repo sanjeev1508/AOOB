@@ -35,7 +35,7 @@ class BoundsEvidence(BaseModel):
     symbol: str = Field(description="Array / pointer / indexed symbol examined.")
     declared_size: Optional[int] = Field(
         default=None,
-        description="Literal size from get_declaration_info when available.",
+        description="Literal size from the compiled case file when available.",
     )
     index_expression: str = Field(
         default="",
@@ -121,7 +121,6 @@ class AlarmInvestigationReport(BaseModel):
         default_factory=list,
         description=(
             "Which tools the agent relied on "
-            "(get_variable_scope / get_declaration_info / get_trimmed_sequence / "
-            "get_function_snippet / get_caller_context)."
+            "(get_window / move_window / inspect / submit_verdict)."
         ),
     )

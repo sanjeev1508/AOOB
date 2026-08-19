@@ -24,7 +24,7 @@ from dotenv import load_dotenv
 
 load_dotenv(ROOT / ".env")
 
-from aoob_agent.agent import investigate_alarm
+from aoob_agent.agent import stream_investigate
 from aoob_agent.data_store import DataStore
 
 GT_PATH = ROOT / "data" / "Full_alarms_with_result.csv"
@@ -33,6 +33,8 @@ SEED = 20260809
 N_TOTAL = 20
 MAX_RETRIES = 3
 RETRY_SLEEP_S = 8.0
+RATE_LIMIT_SLEEP_S = 45.0
+INTER_ALARM_SLEEP_S = 8.0
 
 
 def _load_ground_truth() -> dict[int, str]:
@@ -73,6 +75,15 @@ def build_sample(rng: random.Random) -> list[tuple[int, str]]:
 def _is_timeout(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return "timed out" in msg or "timeout" in msg or "read timeout" in msg
+
+
+def _is_rate_limit(exc: BaseException) -> bool:
+    msg = str(exc)
+    return "429" in msg or "Too Many Requests" in msg
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    return _is_timeout(exc) or _is_rate_limit(exc)
 
 
 def _load_checkpoint() -> dict[int, dict]:
@@ -163,8 +174,42 @@ def main(argv: list[str] | None = None) -> int:
         for attempt in range(1, attempts + 1):
             t0 = time.time()
             try:
-                report = investigate_alarm(oid, store)
-                dump = report.model_dump()
+                dump = None
+                trace: list[dict] = []
+                err_msg = None
+                for event in stream_investigate(oid, store):
+                    et = event.get("type")
+                    if et == "tool_call":
+                        trace.append(
+                            {
+                                "type": "tool_call",
+                                "name": event.get("name"),
+                                "args": event.get("args"),
+                            }
+                        )
+                    elif et == "tool_result":
+                        preview = str(event.get("preview") or "")
+                        trace.append(
+                            {
+                                "type": "tool_result",
+                                "name": event.get("name"),
+                                "preview": preview[:2000],
+                            }
+                        )
+                    elif et == "agent":
+                        trace.append(
+                            {"type": "agent", "content": str(event.get("content") or "")[:2000]}
+                        )
+                    elif et == "status":
+                        msg = str(event.get("message") or "")
+                        if msg.startswith("Case compiled"):
+                            trace.append({"type": "case", "message": msg})
+                    elif et == "report":
+                        dump = event.get("data")
+                    elif et == "error":
+                        err_msg = str(event.get("message") or "stream error")
+                if dump is None:
+                    raise RuntimeError(err_msg or "Investigation finished without a report")
                 elapsed = round(time.time() - t0, 1)
                 agent_cls = dump.get("classification")
                 match = (
@@ -172,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
                     if human.lower().startswith("true")
                     else agent_cls == "false"
                 )
+                be = dump.get("bounds_evidence") or {}
                 row = {
                     "order_id": oid,
                     "human": human,
@@ -179,16 +225,17 @@ def main(argv: list[str] | None = None) -> int:
                     "match": match,
                     "confidence": dump.get("confidence"),
                     "comment": dump.get("comment"),
+                    "summary": dump.get("summary"),
                     "astree_message": dump.get("astree_message"),
-                    "evidence_completeness": (dump.get("bounds_evidence") or {}).get(
-                        "evidence_completeness"
-                    ),
-                    "index_origin_summary": (dump.get("bounds_evidence") or {}).get(
-                        "index_origin_summary"
-                    ),
+                    "evidence_completeness": be.get("evidence_completeness"),
+                    "index_origin_summary": be.get("index_origin_summary"),
+                    "declared_size": be.get("declared_size"),
+                    "index_expression": be.get("index_expression"),
+                    "affected_symbols": dump.get("affected_symbols"),
                     "tools_used": dump.get("tools_used"),
                     "elapsed_s": elapsed,
                     "attempts": attempt,
+                    "trace": trace,
                     "report": dump,
                 }
                 print(
@@ -200,13 +247,16 @@ def main(argv: list[str] | None = None) -> int:
                 break
             except Exception as exc:  # noqa: BLE001
                 elapsed = round(time.time() - t0, 1)
-                if _is_timeout(exc) and attempt < attempts:
+                if _is_retryable(exc) and attempt < attempts:
+                    wait = RATE_LIMIT_SLEEP_S if _is_rate_limit(exc) else RETRY_SLEEP_S
+                    wait *= attempt
+                    kind = "RATE-LIMIT" if _is_rate_limit(exc) else "TIMEOUT"
                     print(
-                        f"TIMEOUT {oid} attempt {attempt}/{attempts}: {exc} "
-                        f"({elapsed}s) — retrying in {RETRY_SLEEP_S}s",
+                        f"{kind} {oid} attempt {attempt}/{attempts}: {exc} "
+                        f"({elapsed}s) — retrying in {wait}s",
                         flush=True,
                     )
-                    time.sleep(RETRY_SLEEP_S)
+                    time.sleep(wait)
                     continue
                 row = {
                     "order_id": oid,
@@ -224,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
         results = [r for r in results if r.get("order_id") != oid]
         results.append(row)
         _write(sample, results)
+        time.sleep(INTER_ALARM_SLEEP_S)
 
     _write(sample, results)
     return 0

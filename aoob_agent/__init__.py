@@ -1,3 +1,13 @@
-"""AOOB alarm investigation agent (LangGraph + Ollama or NVIDIA NIM)."""
+"""AOOB alarm investigation agent (case compiler + window-walk tools)."""
 
-__version__ = "0.1.0"
+from aoob_agent.case_compiler import compile_case
+from aoob_agent.session import begin_session, clear_session, get_session
+
+__version__ = "0.2.0"
+
+__all__ = [
+    "compile_case",
+    "begin_session",
+    "clear_session",
+    "get_session",
+]

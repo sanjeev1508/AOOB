@@ -150,7 +150,6 @@ def highlight(req: HighlightRequest) -> dict[str, Any]:
         _state["store"],
         order,
         variable=req.variable,
-        process=_state["process"],
     )
     if result.get("error") and "alarm" not in result:
         raise HTTPException(404, result["error"])
@@ -208,7 +207,7 @@ async def investigate_stream(req: InvestigateRequest) -> StreamingResponse:
                 idle_rounds += 1
                 msg = (
                     f"Still waiting on {planner_backend_label()}… "
-                    f"({idle_rounds * 12}s). First tool-call can take 1–3 minutes."
+                    f"({idle_rounds * 12}s). Each LLM step can take several minutes."
                 )
                 yield f"data: {json.dumps({'type': 'status', 'message': msg})}\n\n"
                 continue
