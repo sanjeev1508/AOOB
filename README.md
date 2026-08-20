@@ -61,7 +61,11 @@ Order id
   → report JSON (classification / comment / confidence)
 ```
 
-`get_window`, `move_window`, and `inspect` never truncate: whatever function they open, they return it start-to-end (only `pack_path_windows`'s upfront bulk preview applies a line budget, and it flags any cut with a `[WINDOW TRUNCATED]` marker so the LLM knows to re-open that step for the full body).
+`get_window`, `move_window`, and `inspect` never truncate: whatever function they open, they return it start-to-end (only `pack_path_windows`'s upfront bulk preview applies a line budget, and it flags any cut with a `[WINDOW TRUNCATED]` marker so the LLM knows to re-open that step for the full body). Returned lines are dedented (shared leading whitespace stripped, structural anchors like bare braces / `# N "file.c"` markers ignored when computing the shared amount) to cut tokens on deeply-nested legacy C without changing any code content.
+
+**The alarm step must be opened explicitly.** Python's automatic `pack_path_windows()` pass marks every step "opened" for bookkeeping/preview purposes, but that alone no longer satisfies `submit_verdict`'s gate. The LLM must itself call `get_window` or `move_window` (e.g. `step=path_length`) so it lands on the alarm-role step before a verdict is accepted — otherwise `submit_verdict` rejects it and tells the model which step to open.
+
+The `cf_viz` UI's live tool-result preview (SSE) sizes its cap to the tool: `get_window`/`move_window`/`inspect` previews are shown up to ~90K chars (comfortably covering any single function, since `find_enclosing_function` already caps a function span at 1200 lines) instead of a flat 1200-character cut that could land mid-snippet. This only affects what's rendered live in the browser — the LLM's own message history always held the full tool output.
 
 Astrée `[lo, hi]` is an abstract interval, not a concrete runtime index. Missing size/origin ⇒ `review`. `true`/`false` with unknown size is rejected.
 

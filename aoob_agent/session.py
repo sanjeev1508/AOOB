@@ -91,6 +91,16 @@ class CaseSession:
                 return i
         return 0
 
+    def alarm_step_explicitly_reviewed(self) -> bool:
+        """True only if the LLM itself called get_window/move_window while
+        positioned on the alarm-role step — Python's automatic upfront
+        pack_path_windows() pass (which marks every step "opened" for
+        bookkeeping/preview purposes) does not count. submit_verdict uses
+        this so a verdict can't go through on Python's silent pre-fetch
+        alone; the agent must actually navigate to the alarm snippet."""
+        idx = self.alarm_step_index()
+        return idx is not None and idx in self.explicit_review_steps
+
     def alarm_window_fully_reviewed(self) -> bool:
         """True unless the alarm step's window was truncated and never
         explicitly re-opened by the LLM via get_window/move_window."""

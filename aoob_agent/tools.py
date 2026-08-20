@@ -28,6 +28,35 @@ def _dump(payload: dict) -> str:
     return json.dumps(payload, indent=2)
 
 
+def _dedent_rows(rows: list[tuple[int, str]]) -> list[tuple[int, str]]:
+    """Shift snippet lines left by their shared leading whitespace.
+
+    Indentation is cosmetic in C, so cutting the shared prefix saves tokens
+    on deeply-nested legacy code without changing what the LLM can read.
+    Structural anchor lines (a bare brace, or a preprocessor line marker
+    like ``# 144 "file.c"``) sit at column 0 by convention and would force
+    the shared amount to 0 for every function if counted, so they're
+    ignored when computing how much to strip — but every line still only
+    ever loses whitespace it actually has, never other characters.
+    """
+    def _indent(text: str) -> Optional[int]:
+        stripped = text.lstrip(" \t")
+        if not stripped or stripped.startswith("#") or stripped in ("{", "}"):
+            return None
+        return len(text) - len(stripped)
+
+    indents = [i for i in (_indent(t) for _, t in rows) if i is not None]
+    shared = min(indents) if indents else 0
+    if shared <= 0:
+        return rows
+    out: list[tuple[int, str]] = []
+    for ln, text in rows:
+        lead = len(text) - len(text.lstrip(" \t"))
+        cut = min(shared, lead)
+        out.append((ln, text[cut:]))
+    return out
+
+
 def _find_function_span(
     function_name: str, anchor_line: Optional[int] = None
 ) -> tuple[Optional[int], Optional[int]]:
@@ -73,9 +102,10 @@ def _snippet_for_function(
     if start is None or end is None:
         return {"error": f"Could not resolve function span for {function_name!r}."}
     snippet_start, snippet_end = start, end
+    raw_rows = store.get_source_slice(snippet_start, snippet_end)
     lines = [
         {"line": ln, "text": txt}
-        for ln, txt in store.get_source_slice(snippet_start, snippet_end)
+        for ln, txt in _dedent_rows(raw_rows)
     ]
     return {
         "function_name": function_name,
@@ -272,6 +302,22 @@ def submit_verdict(
                     "until the alarm function snippet is shown."
                 ),
                 "current_step": session.current_index + 1,
+                "path_length": session.n_steps,
+            }
+        )
+    if not session.alarm_step_explicitly_reviewed():
+        return _dump(
+            {
+                "accepted": False,
+                "error": (
+                    "You have not personally opened the alarm step yet. The "
+                    "path windows Python attached up front do not count as "
+                    "review — call get_window or move_window (e.g. "
+                    f"step={session.n_steps}) until the alarm-role step's own "
+                    "snippet is returned in your tool results, then "
+                    "submit_verdict."
+                ),
+                "alarm_step_index": session.alarm_step_index(),
                 "path_length": session.n_steps,
             }
         )

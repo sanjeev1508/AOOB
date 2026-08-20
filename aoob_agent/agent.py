@@ -36,7 +36,13 @@ Tools:
 - get_window / move_window — re-open a step's window at a different anchor
   line if you need to see code that a [WINDOW TRUNCATED] or [FUNCTION SPAN]
   marker says was cut off. Use these when a marker is present and the missing
-  code could modify the operand; otherwise they are optional.
+  code could modify the operand; otherwise optional EXCEPT for the alarm step
+  itself (see below).
+- You MUST call get_window or move_window at least once so it lands on the
+  alarm-role step (the last path window, step=path_length) before calling
+  submit_verdict. The path windows Python attached up front are a preview,
+  not a substitute for you actually opening the alarm step yourself —
+  submit_verdict will reject a verdict until you have.
 - submit_verdict(classification, comment, confidence) — true | false | review.
   You MUST call submit_verdict to end the investigation. Writing your
   conclusion as plain text without calling submit_verdict does not count —
@@ -707,8 +713,16 @@ def stream_investigate(order_id: int, store: DataStore, model: Optional[str] = N
                         if not isinstance(msg, ToolMessage):
                             continue
                         preview_t = str(msg.content)
-                        if len(preview_t) > 1200:
-                            preview_t = preview_t[:1200] + "\n…[truncated]"
+                        tool_name = getattr(msg, "name", None) or "tool"
+                        # get_window/move_window/inspect open one whole
+                        # function (data_store caps a function span at 1200
+                        # lines) — the browser preview should size to that,
+                        # not a flat cut that can land mid-snippet. This is
+                        # a display-only cap; the LLM's own message history
+                        # keeps the untruncated ToolMessage either way.
+                        cap = 90_000 if tool_name in {"get_window", "move_window", "inspect"} else 1200
+                        if len(preview_t) > cap:
+                            preview_t = preview_t[:cap] + "\n…[truncated]"
                         yield {
                             "type": "tool_result",
                             "name": getattr(msg, "name", None) or "tool",
