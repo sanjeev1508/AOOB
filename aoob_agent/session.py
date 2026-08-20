@@ -21,8 +21,9 @@ class CaseSession:
         self.inspected: set[str] = set()
         self.verdict: Optional[dict] = None
         # Path-step indices whose shown window omitted part of the function
-        # (via _snippet_for_function's span cut or pack_path_windows' own
-        # line cap), and indices the LLM explicitly re-opened via
+        # (via pack_path_windows' own bulk-preview line cap — get_window /
+        # move_window / inspect always return the complete function and
+        # never truncate), and indices the LLM explicitly re-opened via
         # get_window/move_window after that automatic pass. submit_verdict
         # uses these to stop a high-confidence true/false verdict on a step
         # whose truncated window was never actually re-checked.

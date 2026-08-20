@@ -42,10 +42,6 @@ py -3.13 viz_main.py --serve --host 127.0.0.1 --port 8765
 
 py -3.13 main.py 39 -o reports\alarm_39.json
 
-py -3.13 tests\test_case_compiler.py
-py -3.13 tests\test_evidence_tools.py
-py -3.13 tests\test_agent_gates.py
-
 py -3.13 scripts\batch_eval_20.py
 py -3.13 scripts\batch_eval_20.py --resume --retries 4
 ```
@@ -56,15 +52,20 @@ Send on the UI: highlight paints the compiled path on the CF graph; SSE runs the
 
 ```
 Order id
-  → compile_case (no LLM): object, operand, origin path, Python guards
-  → pack_path_windows: every path snippet is opened in Python
-  → LLM: inspect helpers if listed, then submit_verdict
+  → compile_case (no LLM): object, operand, origin path (from the CF/DF graph), Python guards
+  → pack_path_windows: every path step is opened in Python, in origin→alarm order (budget-capped, [WINDOW TRUNCATED] marks any cut)
+  → LLM: gets the case brief (object declaration + operand scope) and the packed windows before any tool call;
+         may call get_window / move_window (walk the same graph-ordered path step-by-step) or inspect(helper) to
+         re-open a step or helper — these always return the COMPLETE function body, never a clipped slice
+  → submit_verdict: true / false / review
   → report JSON (classification / comment / confidence)
 ```
 
+`get_window`, `move_window`, and `inspect` never truncate: whatever function they open, they return it start-to-end (only `pack_path_windows`'s upfront bulk preview applies a line budget, and it flags any cut with a `[WINDOW TRUNCATED]` marker so the LLM knows to re-open that step for the full body).
+
 Astrée `[lo, hi]` is an abstract interval, not a concrete runtime index. Missing size/origin ⇒ `review`. `true`/`false` with unknown size is rejected.
 
-Layout: `aoob_agent/` (compiler, tools, LangGraph), `cf_viz/` (WebGL + SSE), `scripts/batch_eval_20.py`, `tests/`.
+Layout: `aoob_agent/` (compiler, tools, LangGraph), `cf_viz/` (WebGL + SSE), `scripts/batch_eval_20.py`.
 
 ## Config
 

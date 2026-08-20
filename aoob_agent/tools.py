@@ -57,23 +57,22 @@ def _snippet_for_function(
     function_name: str,
     *,
     anchor_line: Optional[int],
-    context_lines: int = 40,
-    max_lines: int = 120,
 ) -> dict[str, Any]:
+    """Return the complete source span for one function (no context-window cut).
+
+    `get_window` / `move_window` / `inspect` are the LLM's explicit "open this
+    function" tools, so they always hand back the whole function body
+    (start_line..end_line) rather than a clipped anchor-centered slice.
+    `_find_function_span` (via the data store's brace matcher) already caps a
+    single function at 1200 lines, so this stays bounded without an extra cut
+    here. Bulk, budget-limited previews are `pack_path_windows`'s job, not
+    this function's.
+    """
     store = _store()
     start, end = _find_function_span(function_name, anchor_line=anchor_line)
     if start is None or end is None:
         return {"error": f"Could not resolve function span for {function_name!r}."}
-    if end - start + 1 <= max_lines:
-        snippet_start, snippet_end = start, end
-    else:
-        ctx = max(16, min(int(context_lines), 80))
-        anchor = int(anchor_line or start)
-        snippet_start = max(start, anchor - ctx)
-        snippet_end = min(end, snippet_start + max_lines - 1)
-        if anchor_line is not None and not (snippet_start <= int(anchor_line) <= snippet_end):
-            snippet_end = min(end, int(anchor_line) + 24)
-            snippet_start = max(start, snippet_end - max_lines + 1)
+    snippet_start, snippet_end = start, end
     lines = [
         {"line": ln, "text": txt}
         for ln, txt in store.get_source_slice(snippet_start, snippet_end)
@@ -227,7 +226,7 @@ def inspect(function_name: str) -> str:
             }
         )
     session.inspected.add(name)
-    body = _snippet_for_function(name, anchor_line=None, context_lines=60, max_lines=180)
+    body = _snippet_for_function(name, anchor_line=None)
     if body.get("error"):
         return _dump(body)
     return _dump({"helper": name, "inspected": sorted(session.inspected), **body})
