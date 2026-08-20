@@ -33,8 +33,14 @@ Do not invent declarations, callers, writes, or guards.
 
 Tools:
 - inspect(function_name) — only helpers listed on the case file.
+- get_window / move_window — re-open a step's window at a different anchor
+  line if you need to see code that a [WINDOW TRUNCATED] or [FUNCTION SPAN]
+  marker says was cut off. Use these when a marker is present and the missing
+  code could modify the operand; otherwise they are optional.
 - submit_verdict(classification, comment, confidence) — true | false | review.
-  get_window / move_window are optional; windows are already attached.
+  You MUST call submit_verdict to end the investigation. Writing your
+  conclusion as plain text without calling submit_verdict does not count —
+  the conclusion will be lost.
   size unknown or object_undeclared ⇒ review, not true/false.
 
 Rules:
@@ -43,6 +49,9 @@ Rules:
 - if/for guards or a listed constant origin init that keeps the index inside capacity ⇒ false.
 - Index can exceed capacity and no extracted guard/init ⇒ true (medium unless origin is traced).
 - Missing size/origin/allocation ⇒ review.
+- A [WINDOW TRUNCATED] or [FUNCTION SPAN] marker means code was omitted. Do
+  not conclude true/false on the assumption that the omitted code leaves the
+  operand unchanged — either inspect/move_window to see it, or submit review.
 """
 
 REPORT_PROMPT = """JSON report only, no markdown.
@@ -474,7 +483,29 @@ def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[Ca
     def agent_node(state: AgentState) -> dict:
         msgs = list(state["messages"])
         tool_n = _count_tool_messages(msgs)
-        force = tool_n == 0
+        no_tool_streak = int(state.get("consecutive_no_tool_calls") or 0)
+        verdict_in = _verdict_accepted(msgs)
+        force = tool_n == 0 or not verdict_in
+        # If the previous turn was free text with no tool call (a rambling
+        # explanation instead of a decision), a generic "call a tool" nudge
+        # from tool_choice forcing isn't enough on backends that don't honor
+        # it reliably. Inject a short, explicit correction so the retry is
+        # pointed at submitting a verdict, not another round of prose.
+        extra: list = []
+        if no_tool_streak > 0 and not verdict_in:
+            extra = [
+                HumanMessage(
+                    content=(
+                        "Your last reply did not call a tool. Do not write "
+                        "another explanation of what the function does. "
+                        "You already have the evidence (case brief, path "
+                        "window, any inspect/get_window results). Call "
+                        "submit_verdict now with classification, comment, "
+                        "and confidence."
+                    )
+                )
+            ]
+            msgs = msgs + extra
         runner = _bind(force)
         _log(f"[agent] invoke msgs={len(msgs)} tools_so_far={tool_n} backend={current_backend}")
         try:
@@ -486,8 +517,8 @@ def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[Ca
             response = runner.invoke(msgs)
         tool_calls = getattr(response, "tool_calls", None) or []
         _log(f"[agent] tool_calls={len(tool_calls)}")
-        streak = 0 if tool_calls else int(state.get("consecutive_no_tool_calls") or 0) + 1
-        return {"messages": [response], "consecutive_no_tool_calls": streak}
+        streak = 0 if tool_calls else no_tool_streak + 1
+        return {"messages": extra + [response], "consecutive_no_tool_calls": streak}
 
     def tools_node(state: AgentState) -> dict:
         result = ToolNode(TOOLS).invoke(state)
@@ -495,10 +526,18 @@ def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[Ca
         _log(f"[tools] round={rounds}")
         return {**result, "tool_rounds": rounds, "consecutive_no_tool_calls": 0}
 
-    def after_agent(state: AgentState) -> Literal["tools", "report"]:
+    def after_agent(state: AgentState) -> Literal["tools", "agent", "report"]:
         last = state["messages"][-1]
         if isinstance(last, AIMessage) and last.tool_calls:
             return "tools"
+        # Text-only reply with no verdict submitted yet: one forced, directly
+        # corrected retry (see agent_node) before falling back to the
+        # disconnected report-only path. Kept tight on purpose — letting this
+        # run longer just gives an under-forcing backend more room to ramble
+        # instead of calling submit_verdict.
+        streak = int(state.get("consecutive_no_tool_calls") or 0)
+        if not _verdict_accepted(state["messages"]) and streak <= 1:
+            return "agent"
         return "report"
 
     def after_tools(state: AgentState) -> Literal["agent", "report"]:
@@ -520,8 +559,25 @@ def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[Ca
             }
         else:
             data = None
+            prior_reasoning = ""
+            for m in reversed(state["messages"]):
+                if isinstance(m, AIMessage):
+                    text = _message_text(m)
+                    if text:
+                        prior_reasoning = text
+                        break
+            reasoning_block = (
+                f"\nModel's own prior analysis (it did not call submit_verdict "
+                f"for this — carry its conclusion into the JSON fields instead "
+                f"of re-deriving from scratch):\n{prior_reasoning}\n"
+                if prior_reasoning
+                else ""
+            )
             human = HumanMessage(
-                content=f"Order {state['order_id']}\n{active.brief()}\nTools: {sorted(_tool_names_used(state['messages']))}"
+                content=(
+                    f"Order {state['order_id']}\n{active.brief()}\n{reasoning_block}"
+                    f"Tools: {sorted(_tool_names_used(state['messages']))}"
+                )
             )
             try:
                 result = llm.with_structured_output(AlarmInvestigationReport).invoke(
@@ -559,7 +615,9 @@ def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[Ca
     graph.add_node("tools", tools_node)
     graph.add_node("report", report_node)
     graph.add_edge(START, "agent")
-    graph.add_conditional_edges("agent", after_agent, {"tools": "tools", "report": "report"})
+    graph.add_conditional_edges(
+        "agent", after_agent, {"tools": "tools", "agent": "agent", "report": "report"}
+    )
     graph.add_conditional_edges("tools", after_tools, {"agent": "agent", "report": "report"})
     graph.add_edge("report", END)
     return graph.compile()

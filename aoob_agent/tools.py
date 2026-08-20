@@ -99,6 +99,15 @@ def _window_payload() -> dict[str, Any]:
     body = _snippet_for_function(step.function, anchor_line=step.line)
     if body.get("error"):
         return body
+    span = body.get("span") or {}
+    fn_start, fn_end = span.get("start_line"), span.get("end_line")
+    snip_start, snip_end = span.get("snippet_start"), span.get("snippet_end")
+    span_truncated = (
+        fn_start is not None
+        and fn_end is not None
+        and (snip_start > fn_start or snip_end < fn_end)
+    )
+    session.mark_truncated(span_truncated)
     return {
         "path_step": step.step,
         "path_length": session.n_steps,
@@ -114,6 +123,7 @@ def _window_payload() -> dict[str, Any]:
         "case_gaps": list(session.case.gaps),
         "declared_size": session.case.array_size,
         "alarm_window_opened": session.alarm_window_opened(),
+        "window_truncated": bool(span_truncated),
         "remaining_until_alarm": max(0, session.n_steps - 1 - session.current_index),
         **body,
     }
@@ -132,10 +142,28 @@ def pack_path_windows(*, max_lines_per_window: int = 80) -> str:
                 parts.append(f"### Window {i + 1}: {payload['error']}")
                 continue
             rows = payload.get("snippet") or []
+            shown_rows = rows[:max_lines_per_window]
             body = "\n".join(
-                f"{row.get('line')}|{row.get('text', '')}"
-                for row in rows[:max_lines_per_window]
+                f"{row.get('line')}|{row.get('text', '')}" for row in shown_rows
             )
+            hidden = len(rows) - len(shown_rows)
+            if hidden > 0:
+                session.mark_truncated(True)
+                body += (
+                    f"\n[WINDOW TRUNCATED: {hidden} more line(s) of this function "
+                    "were not shown. Do not assume the omitted lines don't modify "
+                    "the operand — treat this as an evidence gap, not a green light.]"
+                )
+            span = payload.get("span") or {}
+            fn_start, fn_end = span.get("start_line"), span.get("end_line")
+            if fn_start is not None and fn_end is not None:
+                snip_start, snip_end = span.get("snippet_start"), span.get("snippet_end")
+                if snip_start is not None and (snip_start > fn_start or snip_end < fn_end):
+                    body += (
+                        f"\n[FUNCTION SPAN {fn_start}-{fn_end}; only "
+                        f"{snip_start}-{snip_end} shown. Code outside this range "
+                        "was not shown and may still affect the operand.]"
+                    )
             guards = payload.get("guards") or []
             gtxt = ("\n  guards: " + " | ".join(guards[:6])) if guards else ""
             parts.append(
@@ -157,6 +185,7 @@ def get_window() -> str:
     Starts at the index origin (first path step). Does not take a function
     name — the compiled case file owns the path.
     """
+    get_session().mark_explicit_review()
     return _dump(_window_payload())
 
 
@@ -173,6 +202,7 @@ def move_window(direction: str = "next", step: int = 0) -> str:
         session.move(direction=direction, step=step)
     except ValueError as exc:
         return _dump({"error": str(exc)})
+    session.mark_explicit_review()
     return _dump(_window_payload())
 
 
@@ -288,6 +318,25 @@ def submit_verdict(
         # Constant-folding / helper-range arguments are valid without an if().
         # Do not bounce the LLM into a parroted review; keep false at medium.
         conf = "medium"
+    if (
+        cls in {"true", "false"}
+        and conf == "high"
+        and not session.alarm_window_fully_reviewed()
+    ):
+        return _dump(
+            {
+                "accepted": False,
+                "error": (
+                    "The alarm step's window was truncated (see [WINDOW "
+                    "TRUNCATED] / [FUNCTION SPAN] markers) and was never "
+                    "re-opened with get_window/move_window. The omitted code "
+                    "may still modify the operand. Call get_window or "
+                    "move_window on that step to check it, or submit at "
+                    "confidence=medium/low, or submit review."
+                ),
+                "alarm_step_index": session.alarm_step_index(),
+            }
+        )
     if cls == "true" and conf == "high" and "missing_df" in gaps and not has_guards:
         return _dump(
             {

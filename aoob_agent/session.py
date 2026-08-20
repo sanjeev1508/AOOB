@@ -20,6 +20,14 @@ class CaseSession:
         self.opened: set[int] = set()
         self.inspected: set[str] = set()
         self.verdict: Optional[dict] = None
+        # Path-step indices whose shown window omitted part of the function
+        # (via _snippet_for_function's span cut or pack_path_windows' own
+        # line cap), and indices the LLM explicitly re-opened via
+        # get_window/move_window after that automatic pass. submit_verdict
+        # uses these to stop a high-confidence true/false verdict on a step
+        # whose truncated window was never actually re-checked.
+        self.truncated_steps: set[int] = set()
+        self.explicit_review_steps: set[int] = set()
 
     @property
     def n_steps(self) -> int:
@@ -66,6 +74,29 @@ class CaseSession:
     def can_inspect(self, name: str) -> bool:
         n = (name or "").strip()
         return bool(n) and n in set(self.case.helpers)
+
+    def mark_truncated(self, truncated: bool) -> None:
+        if truncated:
+            self.truncated_steps.add(self.current_index)
+
+    def mark_explicit_review(self) -> None:
+        self.explicit_review_steps.add(self.current_index)
+
+    def alarm_step_index(self) -> Optional[int]:
+        if not self.case.path:
+            return None
+        for i, step in enumerate(self.case.path):
+            if step.role in {"alarm", "origin_and_alarm"}:
+                return i
+        return 0
+
+    def alarm_window_fully_reviewed(self) -> bool:
+        """True unless the alarm step's window was truncated and never
+        explicitly re-opened by the LLM via get_window/move_window."""
+        idx = self.alarm_step_index()
+        if idx is None or idx not in self.truncated_steps:
+            return True
+        return idx in self.explicit_review_steps
 
 
 def begin_session(case: CaseFile) -> CaseSession:
