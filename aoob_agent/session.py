@@ -20,15 +20,7 @@ class CaseSession:
         self.opened: set[int] = set()
         self.inspected: set[str] = set()
         self.verdict: Optional[dict] = None
-        # Path-step indices whose shown window omitted part of the function
-        # (via pack_path_windows' own bulk-preview line cap — get_window /
-        # move_window / inspect always return the complete function and
-        # never truncate), and indices the LLM explicitly re-opened via
-        # get_window/move_window after that automatic pass. submit_verdict
-        # uses these to stop a high-confidence true/false verdict on a step
-        # whose truncated window was never actually re-checked.
-        self.truncated_steps: set[int] = set()
-        self.explicit_review_steps: set[int] = set()
+        self.size_unknown_retries = 0
 
     @property
     def n_steps(self) -> int:
@@ -42,17 +34,6 @@ class CaseSession:
 
     def mark_opened(self) -> None:
         self.opened.add(self.current_index)
-
-    def alarm_window_opened(self) -> bool:
-        if not self.case.path:
-            return False
-        for i, step in enumerate(self.case.path):
-            if step.role in {"alarm", "origin_and_alarm"} and i in self.opened:
-                return True
-        # Single-step path: opening it is enough.
-        if len(self.case.path) == 1:
-            return 0 in self.opened
-        return False
 
     def move(self, *, direction: str = "", step: int = 0) -> PathStep:
         if not self.case.path:
@@ -75,39 +56,6 @@ class CaseSession:
     def can_inspect(self, name: str) -> bool:
         n = (name or "").strip()
         return bool(n) and n in set(self.case.helpers)
-
-    def mark_truncated(self, truncated: bool) -> None:
-        if truncated:
-            self.truncated_steps.add(self.current_index)
-
-    def mark_explicit_review(self) -> None:
-        self.explicit_review_steps.add(self.current_index)
-
-    def alarm_step_index(self) -> Optional[int]:
-        if not self.case.path:
-            return None
-        for i, step in enumerate(self.case.path):
-            if step.role in {"alarm", "origin_and_alarm"}:
-                return i
-        return 0
-
-    def alarm_step_explicitly_reviewed(self) -> bool:
-        """True only if the LLM itself called get_window/move_window while
-        positioned on the alarm-role step — Python's automatic upfront
-        pack_path_windows() pass (which marks every step "opened" for
-        bookkeeping/preview purposes) does not count. submit_verdict uses
-        this so a verdict can't go through on Python's silent pre-fetch
-        alone; the agent must actually navigate to the alarm snippet."""
-        idx = self.alarm_step_index()
-        return idx is not None and idx in self.explicit_review_steps
-
-    def alarm_window_fully_reviewed(self) -> bool:
-        """True unless the alarm step's window was truncated and never
-        explicitly re-opened by the LLM via get_window/move_window."""
-        idx = self.alarm_step_index()
-        if idx is None or idx not in self.truncated_steps:
-            return True
-        return idx in self.explicit_review_steps
 
 
 def begin_session(case: CaseFile) -> CaseSession:

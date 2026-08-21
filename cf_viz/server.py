@@ -158,7 +158,7 @@ def highlight(req: HighlightRequest) -> dict[str, Any]:
 
 @app.post("/api/investigate/stream")
 async def investigate_stream(req: InvestigateRequest) -> StreamingResponse:
-    """SSE stream with heartbeats while the model call is in progress."""
+    """SSE stream of investigation events."""
     _ensure_loaded()
     order = DataStore._parse_order_id(req.order_id)
     if order is None:
@@ -199,21 +199,10 @@ async def investigate_stream(req: InvestigateRequest) -> StreamingResponse:
     threading.Thread(target=worker, daemon=True, name=f"investigate-{order}").start()
 
     async def event_gen():
-        idle_rounds = 0
         while True:
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=12.0)
-            except asyncio.TimeoutError:
-                idle_rounds += 1
-                msg = (
-                    f"Still waiting on {planner_backend_label()}… "
-                    f"({idle_rounds * 12}s). Each LLM step can take several minutes."
-                )
-                yield f"data: {json.dumps({'type': 'status', 'message': msg})}\n\n"
-                continue
+            item = await queue.get()
             if item is None:
                 break
-            idle_rounds = 0
             yield f"data: {json.dumps(item, default=str)}\n\n"
 
     return StreamingResponse(

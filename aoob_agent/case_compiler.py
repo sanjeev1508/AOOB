@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from aoob_agent.data_store import DataStore
+from aoob_agent.data_store import (
+    DataStore,
+    callees_from_text,
+    collapse_ws,
+    condition_compares_token,
+    identifiers_from_text,
+    is_constant_init_text,
+    member_paths_from_text,
+    subscripts_from_text,
+    token_in_text,
+)
 
 _SKIP_IDENT = frozenset(
     {
@@ -42,14 +51,21 @@ _SKIP_IDENT = frozenset(
         "NULL",
         "TRUE",
         "FALSE",
+        "__aoob_snip",
     }
 )
 
-_OPERAND_MEMBER_RE = re.compile(
-    r"\b([A-Za-z_]\w*(?:\s*(?:\.|->)\s*[A-Za-z_]\w*)+)\b"
+_LEADING_KEYWORDS = (
+    "return",
+    "if",
+    "else",
+    "while",
+    "for",
+    "switch",
+    "case",
+    "sizeof",
+    "void",
 )
-_OPERAND_IDENT_RE = re.compile(r"\b([A-Za-z_]\w*)\b")
-_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 
 
 def sanitize_symbol(name: str) -> str:
@@ -57,102 +73,86 @@ def sanitize_symbol(name: str) -> str:
 
 
 def normalize_member_access(expr: str) -> str:
-    text = (expr or "").strip()
-    text = re.sub(r"\s*->\s*", ".", text)
-    text = re.sub(r"\s*\.\s*", ".", text)
-    return text.strip()
+    text = (expr or "").strip().replace("->", ".")
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == ".":
+            out.append(".")
+            i += 1
+            while i < n and text[i].isspace():
+                i += 1
+            continue
+        if ch.isspace() and out and out[-1] == ".":
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out).strip()
 
 
-_LEADING_STMT_RE = re.compile(
-    r"^(?:return|if|else|while|for|switch|case|sizeof|void)\b\s*",
-    re.I,
-)
+def _strip_leading_keyword(text: str) -> str:
+    s = (text or "").strip()
+    lower = s.lower()
+    for kw in _LEADING_KEYWORDS:
+        if lower.startswith(kw):
+            rest = s[len(kw) :]
+            if not rest or not (rest[0].isalnum() or rest[0] == "_"):
+                return rest.strip()
+    return s
+
+
+def _rightmost_member_path(text: str) -> str:
+    """Keep the rightmost Ident(.Ident)* suffix without regex."""
+    s = (text or "").strip()
+    if not s:
+        return s
+    i = len(s) - 1
+    while i >= 0:
+        ch = s[i]
+        if ch.isalnum() or ch in "._":
+            i -= 1
+            continue
+        break
+    return s[i + 1 :].strip(" .")
 
 
 def clean_indexed_object(raw: str) -> str:
     """Strip statement/cast junk so only the array lvalue remains."""
-    text = (raw or "").strip()
-    text = _LEADING_STMT_RE.sub("", text).strip()
-    # Unbalanced leading parens from `return (Foo.raw` / `((((DFC_stMem`.
+    text = _strip_leading_keyword((raw or "").strip())
     while text.startswith("("):
         text = text[1:].lstrip()
     while text.endswith("("):
         text = text[:-1].rstrip()
     text = text.strip().lstrip(">*+&")
     text = normalize_member_access(text)
-    # Keep the rightmost member path (Ident(.Ident)*).
-    m = re.search(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)$", text)
-    if m:
-        return m.group(1)
-    return text.strip()
+    paths = member_paths_from_text(text)
+    if paths:
+        return paths[-1]
+    ident = _rightmost_member_path(text)
+    return ident or text.strip()
 
 
 def extract_index_accesses(line_text: str) -> list[dict[str, Any]]:
     """Indexed[operand] accesses with 0-based column of '['."""
-    text = line_text or ""
     out: list[dict[str, Any]] = []
-    i = 0
-    n = len(text)
-    while i < n:
-        if text[i] != "[":
-            i += 1
-            continue
-        depth = 1
-        j = i + 1
-        while j < n and depth > 0:
-            if text[j] == "[":
-                depth += 1
-            elif text[j] == "]":
-                depth -= 1
-            j += 1
-        if depth != 0:
-            break
-        operand = text[i + 1 : j - 1].strip()
-        while (
-            operand.startswith("(")
-            and operand.endswith(")")
-            and operand.count("(") == operand.count(")")
-        ):
-            inner = operand[1:-1].strip()
-            if not inner:
-                break
-            operand = inner
-        k = i - 1
-        while k >= 0 and text[k].isspace():
-            k -= 1
-        left_end = k
-        while k >= 0:
-            ch = text[k]
-            if ch.isalnum() or ch == "_":
-                k -= 1
-                continue
-            if ch == ".":
-                k -= 1
-                continue
-            if ch == ">" and k > 0 and text[k - 1] == "-":
-                k -= 2
-                continue
-            if ch == "]":
-                depth_b = 1
-                k -= 1
-                while k >= 0 and depth_b:
-                    if text[k] == "]":
-                        depth_b += 1
-                    elif text[k] == "[":
-                        depth_b -= 1
-                    k -= 1
-                continue
-            break
-        indexed = clean_indexed_object(text[k + 1 : left_end + 1])
+    for rec in subscripts_from_text(line_text or ""):
+        indexed = str(rec.get("indexed") or "")
+        if indexed.startswith("(") or _strip_leading_keyword(indexed) != indexed:
+            indexed = clean_indexed_object(indexed)
+        else:
+            indexed = normalize_member_access(indexed)
+        operand = str(rec.get("operand") or "").strip()
         if indexed and operand:
             out.append(
                 {
                     "indexed": indexed,
                     "operand": operand,
-                    "bracket_col": i,
+                    "bracket_col": rec.get("bracket_col", 0),
                 }
             )
-        i = j
     return out
 
 
@@ -182,13 +182,12 @@ def operand_symbol_candidates(expr: str) -> list[str]:
     """Identifiers in an index operand, members first, then bare names."""
     out: list[str] = []
     seen: set[str] = set()
-    for m in _OPERAND_MEMBER_RE.finditer(expr or ""):
-        name = normalize_member_access(m.group(1))
+    for name in member_paths_from_text(expr or ""):
+        name = normalize_member_access(name)
         if name and name not in seen:
             seen.add(name)
             out.append(name)
-    for m in _OPERAND_IDENT_RE.finditer(expr or ""):
-        token = (m.group(1) or "").strip()
+    for token in identifiers_from_text(expr or ""):
         if not token or token in _SKIP_IDENT or token in seen:
             continue
         seen.add(token)
@@ -199,8 +198,7 @@ def operand_symbol_candidates(expr: str) -> list[str]:
 def callees_in_expression(expr: str) -> list[str]:
     names: list[str] = []
     seen: set[str] = set()
-    for m in _CALL_RE.finditer(expr or ""):
-        name = m.group(1)
+    for name in callees_from_text(expr or ""):
         if not name or name in _SKIP_IDENT or name in seen:
             continue
         seen.add(name)
@@ -220,7 +218,7 @@ def rank_operand_symbol(
     candidates = operand_symbol_candidates(operand_text)
     callees = set(callees_in_expression(operand_text))
     indexed_root = sanitize_symbol(indexed_object).split(".", 1)[0]
-    compact = re.sub(r"\s+", "", operand_text or "")
+    compact = collapse_ws(operand_text or "").replace(" ", "")
     scored: list[tuple[int, str]] = []
     for cand in candidates:
         root = cand.split(".", 1)[0]
@@ -278,6 +276,10 @@ class PathStep:
     line: Optional[int]
     location: str
     access: str
+    sequence: int = 0
+    declared_size: Optional[int] = None
+    datatype: str = ""
+    first_access: bool = False
     argument_expression: Optional[str] = None
     call_site: Optional[str] = None
     note: str = ""
@@ -308,6 +310,50 @@ class CaseFile:
     def array_size(self) -> Optional[int]:
         return self.indexed_object.array_size
 
+    def path_records(self) -> list[dict[str, Any]]:
+        """Structured path steps for the case brief and the UI."""
+        rows: list[dict[str, Any]] = []
+        for step in self.path:
+            rows.append(
+                {
+                    "sequence": step.sequence or step.step,
+                    "step": step.step,
+                    "function": step.function,
+                    "role": step.role,
+                    "symbol": step.symbol,
+                    "scope": step.scope,
+                    "access": step.access,
+                    "declared_size": step.declared_size,
+                    "datatype": step.datatype,
+                    "line": step.line,
+                    "location": step.location,
+                    "first_access": step.first_access,
+                    "argument_expression": step.argument_expression,
+                    "call_site": step.call_site,
+                    "note": step.note,
+                    "guards": list(step.guards or []),
+                }
+            )
+        return rows
+
+    def path_summary(self) -> str:
+        lines = [
+            f"Origin path ({len(self.path)} steps, walk origin -> alarm):",
+        ]
+        if not self.path:
+            return "Origin path: empty"
+        for step in self.path:
+            size = step.declared_size if step.declared_size is not None else "unknown"
+            first = " first" if step.first_access else ""
+            extra = f"  arg={step.argument_expression}" if step.argument_expression else ""
+            lines.append(
+                f"  {step.sequence or step.step}. [{step.role}] {step.function}  "
+                f"{step.symbol} ({step.scope})  access={step.access}  "
+                f"size={size}  dtype={step.datatype or '—'}  "
+                f"line={step.line}{first}  @{step.location}{extra}"
+            )
+        return "\n".join(lines)
+
     def brief(self) -> str:
         obj = self.indexed_object
         size = obj.array_size if obj.array_size is not None else "unknown"
@@ -323,18 +369,7 @@ class CaseFile:
         ]
         if self.helpers:
             lines.append("Helpers in index expression: " + ", ".join(self.helpers))
-        if self.path:
-            lines.append(f"Origin path ({len(self.path)} windows, walk origin → alarm):")
-            for step in self.path:
-                extra = ""
-                if step.argument_expression:
-                    extra = f"  arg={step.argument_expression}"
-                lines.append(
-                    f"  {step.step}. [{step.role}] {step.function}  "
-                    f"{step.symbol} ({step.scope}) @{step.location}{extra}"
-                )
-        else:
-            lines.append("Origin path: empty")
+        lines.append(self.path_summary())
         if self.gaps:
             lines.append("Gaps: " + ", ".join(self.gaps))
         if self.guards:
@@ -344,7 +379,7 @@ class CaseFile:
             for g in self.guards[:12]:
                 lines.append(f"  - {g}")
         lines.append(
-            "Path snippets are attached below (Python). inspect listed helpers if needed, "
+            "Call get_window for a step's full function, inspect listed helpers if needed, "
             "then submit_verdict. Gaps size_unknown / object_undeclared ⇒ review."
         )
         lines.append("--- End case file ---")
@@ -556,24 +591,26 @@ def _usable_arg_idents(idents: list[str], *, callee: str) -> list[str]:
         if x.endswith(("Type", "IterType", "PtrType")):
             continue
         # Generator placeholders like CName, not index variables like CfgIdx.
-        if re.fullmatch(r"C[A-Z][a-z]+", x) and "Idx" not in x:
+        if (
+            "Idx" not in x
+            and len(x) >= 3
+            and x[0] == "C"
+            and x[1].isupper()
+            and x[2:].isalpha()
+            and x[2:].islower()
+        ):
             continue
         out.append(x)
     return out
-
-
-_CONST_INIT_RHS = re.compile(
-    r"=\s*(?:\([^;)]*\)\s*)*(0[xX][0-9A-Fa-f]+|\d+)[uUlL]*\s*;?\s*$"
-)
 
 
 def _looks_like_constant_init(text: str, token: str) -> bool:
     """True when the last assignment of ``token`` on the line is an integer literal."""
     tok = (token or "").strip()
     stmt = (text or "").split("//", 1)[0].strip()
-    if not tok or not re.search(rf"\b{re.escape(tok)}\s*=(?!=)", stmt):
+    if not tok:
         return False
-    return bool(_CONST_INIT_RHS.search(stmt))
+    return is_constant_init_text(stmt, tok)
 
 
 def _collect_constant_inits(
@@ -608,18 +645,11 @@ def _looks_like_bounds_guard(cond: str, token: str) -> bool:
     """Keep comparisons/for-limits on the operand; drop the OOB access itself."""
     text = cond or ""
     tok = (token or "").strip()
-    if not tok or tok not in text:
+    if not tok or not token_in_text(text, tok):
         return False
-    if re.search(rf"\bfor\s*\(.*\b{re.escape(tok)}\b", text):
+    if text.strip().startswith("for") and token_in_text(text, tok):
         return True
-    compared = bool(
-        re.search(rf"\b{re.escape(tok)}\b\s*(<=|>=|<|>|==|!=)", text)
-        or re.search(rf"(<=|>=|<|>|==|!=)\s*\b{re.escape(tok)}\b", text)
-        or re.search(rf"(<=|>=|<|>)\s*\w.*\b{re.escape(tok)}\b", text)
-    )
-    if compared:
-        return True
-    return False
+    return condition_compares_token(text, tok)
 
 
 def _collect_guards(
@@ -893,7 +923,7 @@ def _build_path(
         extra_toks: list[str] = []
         if raw.get("argument_expression"):
             extra_toks = _usable_arg_idents(
-                re.findall(r"\b([A-Za-z_]\w*)\b", str(raw.get("argument_expression"))),
+                identifiers_from_text(str(raw.get("argument_expression"))),
                 callee=str(raw.get("function") or ""),
             )
         guards = _collect_guards(
@@ -1021,7 +1051,13 @@ def compile_case(store: DataStore, order_id: int) -> CaseFile:
 
     all_guards: list[str] = []
     seen_guard: set[str] = set()
+    seen_sym: set[str] = set()
     for step in path:
+        step.sequence = step.step
+        step.declared_size = obj.array_size
+        step.datatype = obj.declared_type or ""
+        step.first_access = step.symbol not in seen_sym
+        seen_sym.add(step.symbol)
         for gtxt in step.guards:
             if gtxt in seen_guard:
                 continue

@@ -41,7 +41,18 @@ def highlight_for_alarm(
             collapsed.append(fn)
     sequence_nodes = collapsed
 
+    function_roles: dict[str, str] = {}
     function_access: dict[str, str] = {}
+    for step in case.path:
+        if not step.function:
+            continue
+        prev = function_roles.get(step.function)
+        if step.role == "origin_and_alarm" or (
+            prev == "origin" and step.role == "alarm"
+        ) or (prev == "alarm" and step.role == "origin"):
+            function_roles[step.function] = "origin_and_alarm"
+        elif prev in {None, "hop"}:
+            function_roles[step.function] = step.role
     for step in case.path:
         if not step.function:
             continue
@@ -150,6 +161,7 @@ def highlight_for_alarm(
         "first_access": first,
         "function_sequence": sequence_nodes,
         "function_access": function_access,
+        "function_roles": function_roles,
         "bridge_nodes": [],
         "highlight_nodes": sequence_nodes,
         "highlight_edge_ids": path_edge_ids,

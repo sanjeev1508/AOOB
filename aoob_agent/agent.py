@@ -20,34 +20,27 @@ from langgraph.prebuilt import ToolNode
 from aoob_agent.case_compiler import CaseFile, compile_case
 from aoob_agent.data_store import DataStore
 from aoob_agent.report import AlarmInvestigationReport
-from aoob_agent.session import begin_session, clear_session, get_session
-from aoob_agent.tools import TOOLS, bind_store, pack_path_windows
+from aoob_agent.session import begin_session, clear_session
+from aoob_agent.tools import TOOLS, bind_store
 
 DEFAULT_NVIDIA_MODEL = "meta/llama-3.1-70b-instruct"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
 SYSTEM_PROMPT = """You are an Astrée out-of-bounds (AOOB) investigator.
 
-Python already compiled the case file and attached every origin→alarm source window.
-Do not invent declarations, callers, writes, or guards.
+Python already compiled the case file, including per-step path metadata
+(scope, sequence, access, declared size, datatype, line). Do not invent
+declarations, callers, writes, or guards.
 
 Tools:
-- inspect(function_name) — only helpers listed on the case file.
-- get_window / move_window — re-open a step's window at a different anchor
-  line if you need to see code that a [WINDOW TRUNCATED] or [FUNCTION SPAN]
-  marker says was cut off. Use these when a marker is present and the missing
-  code could modify the operand; otherwise optional EXCEPT for the alarm step
-  itself (see below).
-- You MUST call get_window or move_window at least once so it lands on the
-  alarm-role step (the last path window, step=path_length) before calling
-  submit_verdict. The path windows Python attached up front are a preview,
-  not a substitute for you actually opening the alarm step yourself —
-  submit_verdict will reject a verdict until you have.
+- get_window() — complete current function body. Call this to read source.
+- move_window(direction="next"|"prev", step=0) — navigate the path only
+  (no source). Call get_window afterwards if you need that step's code.
+- inspect(function_name) — complete helper function body, only helpers listed
+  on the case file.
 - submit_verdict(classification, comment, confidence) — true | false | review.
-  You MUST call submit_verdict to end the investigation. Writing your
-  conclusion as plain text without calling submit_verdict does not count —
-  the conclusion will be lost.
-  size unknown or object_undeclared ⇒ review, not true/false.
+  This is the terminal call. You MUST call it to finish.
+  If declared size is unknown, classification must be review, not true/false.
 
 Rules:
 - Use Python-extracted guards and origin inits. Nearby if() is not a bound unless listed.
@@ -55,9 +48,6 @@ Rules:
 - if/for guards or a listed constant origin init that keeps the index inside capacity ⇒ false.
 - Index can exceed capacity and no extracted guard/init ⇒ true (medium unless origin is traced).
 - Missing size/origin/allocation ⇒ review.
-- A [WINDOW TRUNCATED] or [FUNCTION SPAN] marker means code was omitted. Do
-  not conclude true/false on the assumption that the omitted code leaves the
-  operand unchanged — either inspect/move_window to see it, or submit review.
 """
 
 REPORT_PROMPT = """JSON report only, no markdown.
@@ -72,7 +62,8 @@ class AgentState(TypedDict):
     order_id: int
     report: Optional[dict]
     tool_rounds: int
-    consecutive_no_tool_calls: int
+    idle_turns: int
+    verdict_nudge_sent: int
 
 
 def load_env(project_root: Path) -> None:
@@ -306,21 +297,15 @@ def _verdict_accepted(messages: list) -> Optional[dict]:
     return None
 
 
-def _window_opened(messages: list) -> bool:
-    try:
-        if get_session().alarm_window_opened():
-            return True
-    except RuntimeError:
-        pass
+def _verdict_reject_count(messages: list) -> int:
+    n = 0
     for m in messages:
-        if not isinstance(m, ToolMessage):
-            continue
-        if getattr(m, "name", None) not in {"get_window", "move_window"}:
+        if not isinstance(m, ToolMessage) or getattr(m, "name", None) != "submit_verdict":
             continue
         data = _parse_tool_json(str(m.content))
-        if data and data.get("alarm_window_opened") is True:
-            return True
-    return False
+        if data and data.get("accepted") is False:
+            n += 1
+    return n
 
 
 def _max_tool_budget(path_len: int) -> int:
@@ -477,77 +462,71 @@ def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[Ca
         current_backend = "nvidia"
         return True
 
-    def _bind(force: bool):
-        bound = llm.bind_tools(TOOLS)
-        if not force:
-            return bound
-        try:
-            return llm.bind_tools(TOOLS, tool_choice="any")
-        except TypeError:
-            return bound
+    def _bind():
+        return llm.bind_tools(TOOLS)
 
     def agent_node(state: AgentState) -> dict:
         msgs = list(state["messages"])
         tool_n = _count_tool_messages(msgs)
-        no_tool_streak = int(state.get("consecutive_no_tool_calls") or 0)
-        verdict_in = _verdict_accepted(msgs)
-        force = tool_n == 0 or not verdict_in
-        # If the previous turn was free text with no tool call (a rambling
-        # explanation instead of a decision), a generic "call a tool" nudge
-        # from tool_choice forcing isn't enough on backends that don't honor
-        # it reliably. Inject a short, explicit correction so the retry is
-        # pointed at submitting a verdict, not another round of prose.
+        idle = int(state.get("idle_turns") or 0)
+        nudge_sent = int(state.get("verdict_nudge_sent") or 0)
         extra: list = []
-        if no_tool_streak > 0 and not verdict_in:
+        if idle >= 2 and nudge_sent == 0 and not _verdict_accepted(msgs):
             extra = [
                 HumanMessage(
                     content=(
-                        "Your last reply did not call a tool. Do not write "
-                        "another explanation of what the function does. "
-                        "You already have the evidence (case brief, path "
-                        "window, any inspect/get_window results). Call "
-                        "submit_verdict now with classification, comment, "
-                        "and confidence."
+                        "call submit_verdict now with your best classification "
+                        "given the evidence so far"
                     )
                 )
             ]
             msgs = msgs + extra
-        runner = _bind(force)
+            nudge_sent = 1
+        runner = _bind()
         _log(f"[agent] invoke msgs={len(msgs)} tools_so_far={tool_n} backend={current_backend}")
         try:
             response = runner.invoke(msgs)
         except Exception as exc:  # noqa: BLE001
             if not _try_runtime_fallback(exc):
                 raise
-            runner = _bind(force)
+            runner = _bind()
             response = runner.invoke(msgs)
         tool_calls = getattr(response, "tool_calls", None) or []
         _log(f"[agent] tool_calls={len(tool_calls)}")
-        streak = 0 if tool_calls else no_tool_streak + 1
-        return {"messages": extra + [response], "consecutive_no_tool_calls": streak}
+        next_idle = 0 if tool_calls else idle + 1
+        return {
+            "messages": extra + [response],
+            "idle_turns": next_idle,
+            "verdict_nudge_sent": nudge_sent,
+        }
 
     def tools_node(state: AgentState) -> dict:
         result = ToolNode(TOOLS).invoke(state)
         rounds = int(state.get("tool_rounds") or 0) + 1
         _log(f"[tools] round={rounds}")
-        return {**result, "tool_rounds": rounds, "consecutive_no_tool_calls": 0}
+        return {**result, "tool_rounds": rounds, "idle_turns": 0}
 
     def after_agent(state: AgentState) -> Literal["tools", "agent", "report"]:
         last = state["messages"][-1]
         if isinstance(last, AIMessage) and last.tool_calls:
             return "tools"
-        # Text-only reply with no verdict submitted yet: one forced, directly
-        # corrected retry (see agent_node) before falling back to the
-        # disconnected report-only path. Kept tight on purpose — letting this
-        # run longer just gives an under-forcing backend more room to ramble
-        # instead of calling submit_verdict.
-        streak = int(state.get("consecutive_no_tool_calls") or 0)
-        if not _verdict_accepted(state["messages"]) and streak <= 1:
+        idle = int(state.get("idle_turns") or 0)
+        nudge_sent = int(state.get("verdict_nudge_sent") or 0)
+        if _verdict_accepted(state["messages"]):
+            return "report"
+        # Two idle turns → one submit_verdict nudge; still idle → stop.
+        if idle >= 2 and nudge_sent == 0:
+            return "agent"
+        if idle >= 3 and nudge_sent >= 1:
+            return "report"
+        if idle < 2:
             return "agent"
         return "report"
 
     def after_tools(state: AgentState) -> Literal["agent", "report"]:
         if _verdict_accepted(state["messages"]):
+            return "report"
+        if _verdict_reject_count(state["messages"]) >= 2:
             return "report"
         if _count_tool_messages(state["messages"]) >= _max_tool_budget(path_len):
             return "report"
@@ -564,42 +543,15 @@ def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[Ca
                 "summary": accepted.get("summary") or accepted.get("comment") or "",
             }
         else:
-            data = None
-            prior_reasoning = ""
-            for m in reversed(state["messages"]):
-                if isinstance(m, AIMessage):
-                    text = _message_text(m)
-                    if text:
-                        prior_reasoning = text
-                        break
-            reasoning_block = (
-                f"\nModel's own prior analysis (it did not call submit_verdict "
-                f"for this — carry its conclusion into the JSON fields instead "
-                f"of re-deriving from scratch):\n{prior_reasoning}\n"
-                if prior_reasoning
-                else ""
-            )
-            human = HumanMessage(
-                content=(
-                    f"Order {state['order_id']}\n{active.brief()}\n{reasoning_block}"
-                    f"Tools: {sorted(_tool_names_used(state['messages']))}"
-                )
-            )
-            try:
-                result = llm.with_structured_output(AlarmInvestigationReport).invoke(
-                    [SystemMessage(content=REPORT_PROMPT), human]
-                )
-                data = result.model_dump() if isinstance(result, AlarmInvestigationReport) else result
-            except Exception as exc:  # noqa: BLE001
-                _log(f"[report] structured output failed ({exc})")
-            if data is None:
-                raw = llm.invoke([SystemMessage(content=REPORT_PROMPT), human])
-                try:
-                    data = extract_json(_message_text(raw) if isinstance(raw, AIMessage) else str(raw))
-                except Exception:  # noqa: BLE001
-                    data = _degraded_report_payload(
-                        state["order_id"], state["messages"], "report was not JSON"
-                    )
+            data = {
+                "classification": "review",
+                "comment": (
+                    "The agent failed to converge: it did not call "
+                    "submit_verdict with an accepted classification."
+                ),
+                "confidence": "low",
+                "summary": "Agent failed to converge.",
+            }
         data = _fill_report_from_case(_normalize_report_dict(data), active, state["messages"])
         try:
             report = AlarmInvestigationReport.model_validate(data)
@@ -650,37 +602,63 @@ def stream_investigate(order_id: int, store: DataStore, model: Optional[str] = N
         case = compile_case(store, order_id)
         begin_session(case)
         bind_store(store)
-        packed = pack_path_windows()
+        yield {
+            "type": "path_meta",
+            "steps": case.path_records(),
+            "indexed_object": case.indexed_object.name,
+            "declared_size": case.array_size,
+            "datatype": case.indexed_object.declared_type,
+            "operand": case.operand_symbol,
+            "index_expression": case.index_expression,
+            "alarm_function": case.alarm_function,
+        }
         yield {
             "type": "status",
             "message": (
                 f"Case compiled · operand {case.operand_symbol} · "
                 f"object {case.indexed_object.name} size={case.array_size} · "
-                f"{len(case.path)} path window(s) opened by Python"
+                f"{len(case.path)} path step(s)"
             ),
         }
-        preview = packed if len(packed) <= 2000 else packed[:2000] + "\n…[truncated]"
-        yield {"type": "tool_result", "name": "path_windows", "preview": preview}
 
         agent = build_agent(store, model=model, case=case)
         helpers = ", ".join(case.helpers) if case.helpers else "(none)"
+        human_content = (
+            f"Investigate Order {order_id}.\n\n{case.brief()}\n\n"
+            f"Helpers: {helpers}\n\n"
+            "Call get_window to read a function, inspect listed helpers if needed, "
+            "then submit_verdict. Do not skip submit_verdict."
+        )
+        yield {
+            "type": "agent_input",
+            "data": {
+                "llm": llm_backend_label(),
+                "system_prompt": SYSTEM_PROMPT,
+                "human_message": human_content,
+                "case_brief": case.brief(),
+                "helpers": list(case.helpers),
+                "operand": case.operand_symbol,
+                "indexed_object": case.indexed_object.name,
+                "declared_size": case.array_size,
+                "index_expression": case.index_expression,
+                "guards": list(case.guards),
+                "gaps": list(case.gaps),
+                "path": case.path_records(),
+                "alarm_function": case.alarm_function,
+                "location": case.location,
+                "astree_message": case.astree_message,
+            },
+        }
         initial = {
             "order_id": order_id,
             "messages": [
                 SystemMessage(content=SYSTEM_PROMPT),
-                HumanMessage(
-                    content=(
-                        f"Investigate Order {order_id}.\n\n{case.brief()}\n\n"
-                        f"Helpers: {helpers}\n\n"
-                        f"{packed}\n\n"
-                        "inspect listed helpers if the index wraps the operand; "
-                        "then submit_verdict. Do not skip submit_verdict."
-                    )
-                ),
+                HumanMessage(content=human_content),
             ],
             "report": None,
             "tool_rounds": 0,
-            "consecutive_no_tool_calls": 0,
+            "idle_turns": 0,
+            "verdict_nudge_sent": 0,
         }
         yield {"type": "status", "message": f"Calling {llm_backend_label()}…"}
         final_report = None

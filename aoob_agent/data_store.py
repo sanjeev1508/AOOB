@@ -2,26 +2,18 @@
 
 from __future__ import annotations
 
+import bisect
 import csv
-import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterator, Optional
 
-# Astree location: file:line.col_start-col_end  (end may be line.col)
-_LOC_RE = re.compile(
-    r"^(?P<file>[^:]+):(?P<line>\d+)\.(?P<col_start>\d+)"
-    r"(?:-(?:(?P<end_line>\d+)\.)?(?P<col_end>\d+))?$"
-)
+from tree_sitter import Language, Node, Parser
+import tree_sitter_c as tsc
 
-# Rough C function / method opener for enclosing-snippet search.
-# Allows GNU __attribute__((...)) between storage-class and return type / name.
-_FUNC_START_RE = re.compile(
-    r"^(?:(?:static|inline|extern|unsigned|signed|const|volatile)\s+|"
-    r"__attribute__\s*\(\([^)]*\)\)\s*)*"
-    r"(?:[\w\s\*]+?)\s+(\w+)\s*\([^;]*\)\s*\{?\s*$"
-)
+_C_LANGUAGE = Language(tsc.language())
+_C_PARSER = Parser(_C_LANGUAGE)
 
 # Names too generic for file-wide assignment scans (would cross-contaminate).
 _COMMON_INDEX_NAMES = frozenset(
@@ -54,7 +46,6 @@ _COMMON_INDEX_NAMES = frozenset(
     }
 )
 
-_ATTR_STRIP_RE = re.compile(r"__attribute__\s*\(\([^)]*\)\)")
 _FUNC_NAME_BLACKLIST = frozenset(
     {
         "if",
@@ -69,32 +60,415 @@ _FUNC_NAME_BLACKLIST = frozenset(
     }
 )
 
-# Array declarator: Name[size] followed by initializer / terminator.
-# Allow `=` with `{` on a later line (common in Astrée preprocessed dumps).
-_ARRAY_DECL_RE = re.compile(
-    r"\b(?P<name>[A-Za-z_]\w*)\s*\[\s*(?P<size>[^\]]+?)\s*\]"
-    r"(?P<more>(?:\s*\[[^\]]*\])*)"
-    r"\s*(?:=\s*\{?|;|,|\)|\s*$)"
-)
-
-# C integer literal in declarators: 2, 1u, 16UL, (10u), …
-_C_INT_LIT_RE = re.compile(r"^(?P<digits>\d+)[uUlL]*$")
+_SNIP_PREFIX = "void __aoob_snip(void) {\n"
+_SNIP_SKIP = frozenset({"__aoob_snip"})
 
 
-def _parse_array_size_token(size_tok: str) -> Optional[int]:
-    """Literal size only — no expression evaluation. Strips one () layer."""
-    t = (size_tok or "").strip()
-    if t.startswith("(") and t.endswith(")"):
-        t = t[1:-1].strip()
-    m = _C_INT_LIT_RE.fullmatch(t)
-    if not m:
+def _iter_nodes(root: Node) -> Iterator[Node]:
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        for i in range(node.child_count - 1, -1, -1):
+            child = node.child(i)
+            if child is not None:
+                stack.append(child)
+
+
+def _node_text(source: bytes, node: Optional[Node]) -> str:
+    if node is None:
+        return ""
+    return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
+
+
+def collapse_ws(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def ident_token(name: str) -> bool:
+    if not name:
+        return False
+    if not (name[0].isalpha() or name[0] == "_"):
+        return False
+    return all(ch.isalnum() or ch == "_" for ch in name)
+
+
+def token_in_text(text: str, token: str) -> bool:
+    if not token or not text:
+        return False
+    start = 0
+    n = len(token)
+    while True:
+        idx = text.find(token, start)
+        if idx < 0:
+            return False
+        left_ok = idx == 0 or not (text[idx - 1].isalnum() or text[idx - 1] == "_")
+        right = idx + n
+        right_ok = right >= len(text) or not (text[right].isalnum() or text[right] == "_")
+        if left_ok and right_ok:
+            return True
+        start = idx + 1
+
+
+def parse_location(loc: str) -> Optional[dict]:
+    """Parse ``file:line.col`` / ``file:line.col-col`` / ``file:line.col-line.col``."""
+    text = (loc or "").strip()
+    if ":" not in text:
         return None
-    return int(m.group("digits"))
+    file_part, rest = text.rsplit(":", 1)
+    dash = rest.find("-")
+    start = rest if dash < 0 else rest[:dash]
+    end = rest[dash + 1 :] if dash >= 0 else ""
+    if "." not in start:
+        return None
+    line_s, col_s = start.split(".", 1)
+    if not line_s.isdigit() or not col_s.isdigit():
+        return None
+    line = int(line_s)
+    col_start = int(col_s)
+    end_line = line
+    col_end = col_start
+    if end:
+        if "." in end:
+            el, ec = end.split(".", 1)
+            if el.isdigit():
+                end_line = int(el)
+            if ec.isdigit():
+                col_end = int(ec)
+        elif end.isdigit():
+            col_end = int(end)
+    return {
+        "file": file_part,
+        "line": line,
+        "col_start": col_start,
+        "col_end": col_end,
+        "end_line": end_line,
+    }
 
-# Pointer-ish declarator: ... * Name [=|;|,)]
-_PTR_DECL_RE = re.compile(
-    r"(?P<head>[\w\s\*]+?)\b(?P<name>[A-Za-z_]\w*)\s*[;=,)]"
-)
+
+def parse_c_source(text: str) -> tuple[bytes, Any]:
+    blob = text.encode("utf-8")
+    return blob, _C_PARSER.parse(blob)
+
+
+def parse_snippet(text: str) -> tuple[bytes, Any]:
+    wrapped = f"{_SNIP_PREFIX}{text}\n}}\n"
+    return parse_c_source(wrapped)
+
+
+def _eval_int_literal(text: str) -> Optional[int]:
+    raw = collapse_ws(text).replace(" ", "")
+    if not raw:
+        return None
+    while raw.startswith("(") and raw.endswith(")") and len(raw) > 2:
+        raw = raw[1:-1]
+    suffixes = ("ULL", "LLU", "UL", "LU", "LL", "U", "L")
+    upper = raw.upper()
+    for suf in suffixes:
+        if upper.endswith(suf):
+            raw = raw[: -len(suf)]
+            upper = raw.upper()
+            break
+    if raw.startswith(("0x", "0X")):
+        try:
+            return int(raw, 16)
+        except ValueError:
+            return None
+    if raw.isdigit():
+        return int(raw)
+    return None
+
+
+def _eval_size_node(source: bytes, node: Optional[Node]) -> tuple[Optional[int], str]:
+    if node is None:
+        return None, "missing array size expression"
+    text = collapse_ws(_node_text(source, node))
+    lit = _eval_int_literal(text)
+    if lit is not None:
+        return lit, ""
+    if node.type in {"parenthesized_expression", "cast_expression"}:
+        for child in node.named_children:
+            if child.type == "type_descriptor":
+                continue
+            size, note = _eval_size_node(source, child)
+            if size is not None:
+                return size, note
+    if node.type == "sizeof_expression":
+        return None, f"non-literal array size: {text[:80]}"
+    return None, f"non-literal array size: {text[:80]}"
+
+
+def _unwrap_declarator(node: Optional[Node]) -> Optional[Node]:
+    cur = node
+    while cur is not None and cur.type in {
+        "pointer_declarator",
+        "function_declarator",
+        "parenthesized_declarator",
+        "abstract_pointer_declarator",
+    }:
+        nxt = cur.child_by_field_name("declarator")
+        if nxt is None and cur.named_children:
+            nxt = cur.named_children[0]
+        cur = nxt
+    return cur
+
+
+def _declarator_name(source: bytes, node: Optional[Node]) -> str:
+    cur = _unwrap_declarator(node)
+    if cur is None:
+        return ""
+    if cur.type == "array_declarator":
+        return _declarator_name(source, cur.child_by_field_name("declarator"))
+    if cur.type in {"identifier", "field_identifier", "type_identifier"}:
+        return _node_text(source, cur)
+    for child in _iter_nodes(cur):
+        if child.type in {"identifier", "field_identifier"}:
+            return _node_text(source, child)
+    return ""
+
+
+def _find_array_declarator(node: Optional[Node]) -> Optional[Node]:
+    cur = node
+    seen = 0
+    while cur is not None and seen < 12:
+        seen += 1
+        if cur.type == "array_declarator":
+            return cur
+        if cur.type in {
+            "pointer_declarator",
+            "function_declarator",
+            "parenthesized_declarator",
+        }:
+            cur = cur.child_by_field_name("declarator")
+            continue
+        break
+    if node is None:
+        return None
+    for child in _iter_nodes(node):
+        if child.type == "array_declarator":
+            return child
+    return None
+
+
+def _count_initializer_elements(node: Optional[Node]) -> Optional[int]:
+    if node is None:
+        return None
+    if node.type == "initializer_list":
+        return sum(1 for ch in node.named_children if ch.type != "comment")
+    if node.type == "init_declarator":
+        return _count_initializer_elements(node.child_by_field_name("value"))
+    return None
+
+
+def _type_prefix(source: bytes, node: Node) -> str:
+    bits: list[str] = []
+    for child in node.children:
+        if child.type in {
+            "field_declaration_list",
+            ";",
+            ",",
+            "comment",
+            "attribute_specifier",
+        }:
+            continue
+        if child.type in {
+            "init_declarator",
+            "array_declarator",
+            "pointer_declarator",
+            "function_declarator",
+            "identifier",
+            "field_identifier",
+            "parenthesized_declarator",
+        }:
+            break
+        bits.append(_node_text(source, child))
+    return collapse_ws(" ".join(bits)) or "unknown"
+
+
+def _function_name_from_definition(source: bytes, node: Node) -> str:
+    decl = node.child_by_field_name("declarator")
+    name = _declarator_name(source, decl)
+    if name and name not in _FUNC_NAME_BLACKLIST:
+        return name
+    for child in _iter_nodes(node):
+        if child.type == "function_declarator":
+            inner = child.child_by_field_name("declarator")
+            name = _declarator_name(source, inner)
+            if name and name not in _FUNC_NAME_BLACKLIST:
+                return name
+    return ""
+
+
+def _looks_constant_expr(node: Node) -> bool:
+    const_types = {
+        "number_literal",
+        "char_literal",
+        "string_literal",
+        "null",
+        "true",
+        "false",
+    }
+    if node.type in const_types:
+        return True
+    if node.type in {"parenthesized_expression", "cast_expression", "unary_expression"}:
+        kids = [ch for ch in node.named_children if ch.type != "type_descriptor"]
+        return bool(kids) and all(_looks_constant_expr(ch) for ch in kids)
+    if node.type == "binary_expression":
+        kids = list(node.named_children)
+        return bool(kids) and all(_looks_constant_expr(ch) for ch in kids)
+    if node.type == "sizeof_expression":
+        return True
+    return False
+
+
+def identifiers_from_text(text: str) -> list[str]:
+    blob, tree = parse_snippet((text or "") + ";")
+    out: list[str] = []
+    seen: set[str] = set()
+    for node in _iter_nodes(tree.root_node):
+        if node.type not in {"identifier", "field_identifier"}:
+            continue
+        if node.start_point[0] != 1:
+            continue
+        name = _node_text(blob, node)
+        if not name or name in _SNIP_SKIP or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def member_paths_from_text(text: str) -> list[str]:
+    blob, tree = parse_snippet((text or "") + ";")
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _path(node: Node) -> str:
+        if node.type in {"identifier", "field_identifier"}:
+            return _node_text(blob, node)
+        if node.type in {"field_expression", "pointer_expression"}:
+            arg = node.child_by_field_name("argument")
+            field = node.child_by_field_name("field")
+            if arg is None or field is None:
+                named = node.named_children
+                if len(named) >= 2:
+                    arg, field = named[0], named[-1]
+                else:
+                    return collapse_ws(_node_text(blob, node)).replace("->", ".")
+            left = _path(arg)
+            right = _node_text(blob, field)
+            if left and right:
+                return f"{left}.{right}"
+        if node.type == "subscript_expression":
+            arg = node.child_by_field_name("argument")
+            return _path(arg) if arg is not None else ""
+        if node.type == "parenthesized_expression" and node.named_children:
+            return _path(node.named_children[0])
+        return ""
+
+    for node in _iter_nodes(tree.root_node):
+        if node.type in {"field_expression"}:
+            if node.start_point[0] != 1:
+                continue
+            path = _path(node)
+            if path and path not in seen and "__aoob_snip" not in path:
+                seen.add(path)
+                out.append(path)
+    return out
+
+
+def callees_from_text(text: str) -> list[str]:
+    blob, tree = parse_snippet((text or "") + ";")
+    names: list[str] = []
+    seen: set[str] = set()
+    for node in _iter_nodes(tree.root_node):
+        if node.type != "call_expression":
+            continue
+        fn = node.child_by_field_name("function")
+        if fn is None:
+            continue
+        raw = collapse_ws(_node_text(blob, fn))
+        ident = raw.replace("->", ".").split(".")[-1]
+        if ident in _SNIP_SKIP or (fn is not None and fn.start_point[0] != 1):
+            continue
+        if ident and ident not in seen:
+            seen.add(ident)
+            names.append(ident)
+    return names
+
+
+def subscripts_from_text(line_text: str) -> list[dict[str, Any]]:
+    """subscript_expression nodes in one source line (AST, line-break safe)."""
+    blob, tree = parse_snippet(line_text or "")
+    out: list[dict[str, Any]] = []
+    for node in _iter_nodes(tree.root_node):
+        if node.type != "subscript_expression":
+            continue
+        if node.start_point[0] != 1:
+            continue
+        arg = node.child_by_field_name("argument")
+        idx = node.child_by_field_name("index")
+        if arg is None or idx is None:
+            named = node.named_children
+            if len(named) >= 2:
+                arg, idx = named[0], named[1]
+            else:
+                continue
+        bracket_col = None
+        for ch in node.children:
+            if ch.type == "[":
+                bracket_col = ch.start_point[1]
+                break
+        if bracket_col is None:
+            bracket_col = node.start_point[1]
+        indexed_raw = collapse_ws(_node_text(blob, arg)).replace("->", ".")
+        indexed_raw = indexed_raw.replace(" ", "")
+        out.append(
+            {
+                "indexed": indexed_raw,
+                "operand": collapse_ws(_node_text(blob, idx)),
+                "bracket_col": bracket_col,
+                "text": collapse_ws(_node_text(blob, node)),
+            }
+        )
+    return out
+
+
+def is_constant_init_text(text: str, token: str) -> bool:
+    if not token or not text:
+        return False
+    blob, tree = parse_snippet(text if text.rstrip().endswith(";") else text + ";")
+    for node in _iter_nodes(tree.root_node):
+        if node.type == "assignment_expression":
+            left = node.child_by_field_name("left")
+            right = node.child_by_field_name("right")
+            lhs = collapse_ws(_node_text(blob, left)) if left else ""
+            if token_in_text(lhs, token.split(".")[-1]) or lhs.endswith(token) or token in lhs:
+                return bool(right) and _looks_constant_expr(right)
+        if node.type == "init_declarator":
+            d = node.child_by_field_name("declarator")
+            v = node.child_by_field_name("value")
+            name = _declarator_name(blob, d)
+            if name == token or name.endswith(token.split(".")[-1]):
+                return bool(v) and _looks_constant_expr(v)
+    return False
+
+
+def condition_compares_token(condition: str, token: str) -> bool:
+    if not token_in_text(condition or "", token):
+        return False
+    blob, tree = parse_snippet(f"if ({condition}) {{}}")
+    for node in _iter_nodes(tree.root_node):
+        if node.type != "binary_expression":
+            continue
+        op = ""
+        for ch in node.children:
+            if ch.type in {"<", ">", "<=", ">=", "==", "!="}:
+                op = ch.type
+                break
+        if op and token_in_text(_node_text(blob, node), token):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -109,16 +483,7 @@ class AlarmRecord:
 
     @property
     def parsed_location(self) -> Optional[dict]:
-        m = _LOC_RE.match(self.location.strip())
-        if not m:
-            return None
-        return {
-            "file": m.group("file"),
-            "line": int(m.group("line")),
-            "col_start": int(m.group("col_start")),
-            "col_end": int(m.group("col_end") or m.group("col_start")),
-            "end_line": int(m.group("end_line") or m.group("line")),
-        }
+        return parse_location(self.location)
 
 
 @dataclass(frozen=True)
@@ -177,18 +542,27 @@ class DataStore:
     )
     source_lines: list[str] = field(default_factory=list)
     declarations: dict[str, DeclarationRecord] = field(default_factory=dict)
-    # All declaration hits for a name (first wins in ``declarations``).
     declarations_all: dict[str, list[DeclarationRecord]] = field(
         default_factory=lambda: defaultdict(list)
     )
-    # Variable → typedef/struct type name (from ``Type Name;``).
     object_types: dict[str, str] = field(default_factory=dict)
-    # Typedef/struct type → array member fields (from typedef body).
     type_array_fields: dict[str, list[DeclarationRecord]] = field(
         default_factory=lambda: defaultdict(list)
     )
-    # Filename prefix taken from alarm Location values (e.g. ALL_bc_with_context.c).
     source_file_tag: str = "input.c"
+    source_bytes: bytes = b""
+    source_tree: Any = None
+    _functions_by_name: dict[str, list[tuple[int, int]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    _functions_by_start: dict[int, tuple[str, int, int]] = field(default_factory=dict)
+    _function_spans: list[tuple[int, int, str]] = field(default_factory=list)
+    _fn_start_keys: list[int] = field(default_factory=list)
+    _assigns: list[dict[str, Any]] = field(default_factory=list)
+    _guards: list[dict[str, Any]] = field(default_factory=list)
+    _calls_by_line: dict[int, list[dict[str, Any]]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
 
     @classmethod
     def load(cls, data_dir: Path | str) -> "DataStore":
@@ -222,15 +596,13 @@ class DataStore:
 
     def _read_semicolon_csv(self, path: Path) -> list[dict[str, str]]:
         text = path.read_text(encoding="utf-8", errors="replace")
-        # Drop Astrée "sep=;" preamble / section titles before the real header.
         lines = text.splitlines()
         header_idx = None
         for i, line in enumerate(lines):
             if ";" in line and not line.lower().startswith("sep="):
-                # Prefer a line that looks like a CSV header (letters + ;).
-                if re.search(r"[A-Za-z]", line.split(";")[0]):
+                first = line.split(";")[0]
+                if any(ch.isalpha() for ch in first):
                     header_idx = i
-                    # For control-flow report, skip until Caller;Callee...
                     if "Caller" in line or "Variable" in line or "Order" in line:
                         break
         if header_idx is None:
@@ -241,8 +613,11 @@ class DataStore:
 
     @staticmethod
     def parse_location_line(location: str) -> Optional[int]:
-        m = _LOC_RE.match((location or "").strip())
-        return int(m.group("line")) if m else None
+        parsed = parse_location(location or "")
+        if not parsed:
+            return None
+        line = parsed.get("line")
+        return int(line) if isinstance(line, int) else None
 
     @staticmethod
     def _parse_order_id(raw: str) -> Optional[int]:
@@ -288,7 +663,6 @@ class DataStore:
             if line is not None:
                 self.data_flow_by_line[line].append(rec)
             if rec.variable:
-                # Index bare name (before @scope) and full string.
                 bare = rec.variable.split("@", 1)[0].strip('"')
                 self.data_flow_by_variable[bare].append(rec)
                 self.data_flow_by_variable[rec.variable].append(rec)
@@ -312,10 +686,139 @@ class DataStore:
                 self.control_by_line[line].append(rec)
 
     def _load_source(self, path: Path) -> None:
-        # Keep a leading empty slot so line numbers are 1-based.
-        self.source_lines = [""] + path.read_text(
-            encoding="utf-8", errors="replace"
-        ).splitlines()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        self.source_lines = [""] + text.splitlines()
+        self.source_bytes, self.source_tree = parse_c_source(text)
+        self._index_ast_spans()
+
+    def _index_ast_spans(self) -> None:
+        self._functions_by_name.clear()
+        self._functions_by_start.clear()
+        self._function_spans.clear()
+        self._assigns.clear()
+        self._guards.clear()
+        self._calls_by_line.clear()
+        if self.source_tree is None:
+            return
+        src = self.source_bytes
+        for node in _iter_nodes(self.source_tree.root_node):
+            ntype = node.type
+            if ntype == "function_definition":
+                name = _function_name_from_definition(src, node)
+                if not name:
+                    continue
+                start = node.start_point[0] + 1
+                end = node.end_point[0] + 1
+                self._functions_by_name[name].append((start, end))
+                self._functions_by_start[start] = (name, start, end)
+                self._function_spans.append((start, end, name))
+            elif ntype == "assignment_expression":
+                left = node.child_by_field_name("left")
+                right = node.child_by_field_name("right")
+                op = "="
+                for ch in node.children:
+                    t = ch.type
+                    if t in {"=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="}:
+                        op = t
+                        break
+                self._assigns.append(
+                    {
+                        "line": node.start_point[0] + 1,
+                        "lhs": collapse_ws(_node_text(src, left)),
+                        "op": op,
+                        "rhs": collapse_ws(_node_text(src, right)),
+                        "text": collapse_ws(_node_text(src, node))[:300],
+                    }
+                )
+            elif ntype == "init_declarator":
+                val = node.child_by_field_name("value")
+                if val is None:
+                    continue
+                d = node.child_by_field_name("declarator")
+                self._assigns.append(
+                    {
+                        "line": node.start_point[0] + 1,
+                        "lhs": _declarator_name(src, d),
+                        "op": "=",
+                        "rhs": collapse_ws(_node_text(src, val)),
+                        "text": collapse_ws(_node_text(src, node))[:300],
+                    }
+                )
+            elif ntype == "update_expression":
+                arg = node.child_by_field_name("argument")
+                if arg is None and node.named_children:
+                    arg = node.named_children[0]
+                self._assigns.append(
+                    {
+                        "line": node.start_point[0] + 1,
+                        "lhs": collapse_ws(_node_text(src, arg)),
+                        "op": "++/--",
+                        "rhs": "",
+                        "text": collapse_ws(_node_text(src, node))[:300],
+                    }
+                )
+            elif ntype in {
+                "if_statement",
+                "while_statement",
+                "for_statement",
+                "switch_statement",
+                "conditional_expression",
+            }:
+                cond = node.child_by_field_name("condition")
+                kind = {
+                    "if_statement": "if",
+                    "while_statement": "while",
+                    "for_statement": "for",
+                    "switch_statement": "switch",
+                    "conditional_expression": "ternary",
+                }[ntype]
+                if cond is None and ntype == "for_statement":
+                    named = [ch for ch in node.named_children if ch.type != "compound_statement"]
+                    cond = named[1] if len(named) >= 2 else None
+                if cond is None:
+                    continue
+                self._guards.append(
+                    {
+                        "line": node.start_point[0] + 1,
+                        "kind": kind,
+                        "condition": collapse_ws(_node_text(src, cond))[:240],
+                    }
+                )
+            elif ntype == "call_expression":
+                fn = node.child_by_field_name("function")
+                args_n = node.child_by_field_name("arguments")
+                fn_text = collapse_ws(_node_text(src, fn))
+                fn_name = fn_text.replace("->", ".").split(".")[-1]
+                arg_nodes = [
+                    ch
+                    for ch in (args_n.named_children if args_n is not None else [])
+                    if ch.type != "comment"
+                ]
+                line = node.start_point[0] + 1
+                self._calls_by_line[line].append(
+                    {
+                        "function": fn_name,
+                        "function_text": fn_text,
+                        "args": [collapse_ws(_node_text(src, a)) for a in arg_nodes],
+                        "call_text": collapse_ws(_node_text(src, node))[:280],
+                        "line": line,
+                        "end_line": node.end_point[0] + 1,
+                    }
+                )
+        self._function_spans.sort(key=lambda s: s[0])
+        self._fn_start_keys = [s[0] for s in self._function_spans]
+        self._assigns.sort(key=lambda a: a["line"])
+        self._guards.sort(key=lambda g: g["line"])
+
+    def function_span(
+        self, name: str, near_line: Optional[int] = None
+    ) -> Optional[tuple[int, int]]:
+        spans = self._functions_by_name.get(name) or []
+        if not spans:
+            return None
+        if near_line is None:
+            return spans[0]
+        return min(spans, key=lambda sp: abs(sp[0] - near_line))
 
     def get_alarm(self, order_id: int) -> Optional[AlarmRecord]:
         return self.alarms.get(order_id)
@@ -325,292 +828,121 @@ class DataStore:
         end = min(len(self.source_lines) - 1, end)
         return [(i, self.source_lines[i]) for i in range(start, end + 1)]
 
-    @staticmethod
-    def _split_c_args(arg_text: str) -> list[str]:
-        """Split a comma-separated C argument list respecting nested () []."""
-        parts: list[str] = []
-        cur: list[str] = []
-        depth = 0
-        for ch in arg_text:
-            if ch in "([":
-                depth += 1
-                cur.append(ch)
-            elif ch in ")]":
-                depth = max(0, depth - 1)
-                cur.append(ch)
-            elif ch == "," and depth == 0:
-                parts.append("".join(cur).strip())
-                cur = []
-            else:
-                cur.append(ch)
-        if cur or parts:
-            parts.append("".join(cur).strip())
-        return [p for p in parts if p]
-
     def _window_text(self, start_line: int, end_line: int) -> str:
         start_line = max(1, start_line)
         end_line = min(len(self.source_lines) - 1, end_line)
-        return "\n".join(
-            self.source_lines[i] for i in range(start_line, end_line + 1)
-        )
+        return "\n".join(self.source_lines[i] for i in range(start_line, end_line + 1))
 
     def parse_function_parameters(
         self, function_name: str, near_line: Optional[int] = None
     ) -> list[dict]:
-        """Parse parameter names/types from a function header (structural)."""
+        """Parse parameter names/types from a function_definition parameter_list."""
         fn = (function_name or "").strip()
-        if not fn:
+        if not fn or self.source_tree is None:
             return []
-        # Prefer definition near ``near_line``; else any header match.
-        candidates: list[int] = []
+        spans = self._functions_by_name.get(fn) or []
+        if not spans:
+            return []
         if near_line is not None:
-            for ln in range(max(1, near_line - 3), min(len(self.source_lines), near_line + 2)):
-                if self._looks_like_function_header(ln) == fn:
-                    candidates.append(ln)
-                    break
-        if not candidates:
-            for ln in range(1, len(self.source_lines)):
-                if self._looks_like_function_header(ln) == fn:
-                    candidates.append(ln)
-                    if len(candidates) >= 3:
-                        break
-        if not candidates:
-            return []
-
-        start = candidates[0]
-        blob = self._window_text(start, start + 25)
-        blob = _ATTR_STRIP_RE.sub(" ", blob)
-        m = re.search(rf"\b{re.escape(fn)}\s*\(", blob)
-        if not m:
-            return []
-        i = m.end() - 1  # at '('
-        depth = 0
-        end = None
-        for j in range(i, len(blob)):
-            if blob[j] == "(":
-                depth += 1
-            elif blob[j] == ")":
-                depth -= 1
-                if depth == 0:
-                    end = j
-                    break
-        if end is None:
-            return []
-        raw_args = blob[i + 1 : end]
-        params: list[dict] = []
-        for idx, piece in enumerate(self._split_c_args(raw_args)):
-            piece_n = re.sub(r"\s+", " ", piece).strip()
-            if not piece_n or piece_n == "void":
+            start, end = min(spans, key=lambda sp: abs(sp[0] - near_line))
+        else:
+            start, end = spans[0]
+        src = self.source_bytes
+        for node in _iter_nodes(self.source_tree.root_node):
+            if node.type != "function_definition":
                 continue
-            # Drop trailing array brackets on the name: Type name[]
-            piece_n = re.sub(r"\[\s*\]", "", piece_n)
-            # Name is rightmost identifier (handle pointers).
-            nm = re.search(r"([A-Za-z_]\w*)\s*$", piece_n)
-            if not nm:
+            if node.start_point[0] + 1 != start:
                 continue
-            name = nm.group(1)
-            typ = piece_n[: nm.start()].strip().rstrip("*").strip()
-            typ = re.sub(r"\s*\*+\s*$", "", typ).strip()
-            params.append(
-                {
-                    "index": idx,
-                    "name": name,
-                    "declared_type": typ or None,
-                    "raw": piece_n[:160],
-                }
-            )
-        return params
+            if _function_name_from_definition(src, node) != fn:
+                continue
+            decl = node.child_by_field_name("declarator")
+            plist = None
+            cur = decl
+            while cur is not None:
+                if cur.type == "function_declarator":
+                    plist = cur.child_by_field_name("parameters")
+                    break
+                cur = cur.child_by_field_name("declarator")
+            if plist is None:
+                return []
+            params: list[dict] = []
+            idx = 0
+            for child in plist.named_children:
+                if child.type != "parameter_declaration":
+                    continue
+                name = _declarator_name(src, child.child_by_field_name("declarator"))
+                typ = _type_prefix(src, child)
+                raw = collapse_ws(_node_text(src, child))
+                if raw == "void" or not name:
+                    idx += 1
+                    continue
+                params.append(
+                    {
+                        "index": idx,
+                        "name": name,
+                        "declared_type": typ or None,
+                        "raw": raw[:160],
+                    }
+                )
+                idx += 1
+            return params
+        return []
 
     def extract_call_argument_expression(
         self, callee: str, call_line: int, arg_index: int
     ) -> Optional[dict]:
-        """Extract the ``arg_index``-th argument expression at a call near ``call_line``."""
+        """Extract the ``arg_index``-th argument of a call_expression near ``call_line``."""
         fn = (callee or "").strip()
         if not fn or arg_index < 0:
             return None
-        # Search a small window — calls may wrap across lines.
-        for start in range(max(1, call_line - 2), call_line + 1):
-            blob = self._window_text(start, start + 12)
-            # Find fn( ... ) with matching parens (last occurrence near call_line).
-            for m in re.finditer(rf"\b{re.escape(fn)}\s*\(", blob):
-                i = m.end() - 1
-                depth = 0
-                end = None
-                for j in range(i, len(blob)):
-                    ch = blob[j]
-                    if ch == "(":
-                        depth += 1
-                    elif ch == ")":
-                        depth -= 1
-                        if depth == 0:
-                            end = j
-                            break
-                if end is None:
+        for ln in range(max(1, call_line - 2), call_line + 13):
+            for rec in self._calls_by_line.get(ln, []):
+                if rec["line"] > call_line + 10:
                     continue
-                args = self._split_c_args(blob[i + 1 : end])
+                hit = rec["function"] == fn or fn in rec["function_text"]
+                if not hit:
+                    # indirect call: table[i](...) — still accept if this line matches
+                    if rec["function"] and rec["function"] != fn and "[" not in rec["function_text"]:
+                        continue
+                    if not rec["args"]:
+                        continue
+                args = rec["args"]
                 if arg_index >= len(args):
                     continue
-                expr = re.sub(r"\s+", " ", args[arg_index]).strip()
-                idents = re.findall(r"\b([A-Za-z_]\w*)\b", expr)
-                # Drop the callee name if it appeared (shouldn't in arg).
-                idents = [x for x in idents if x != fn]
+                expr = args[arg_index]
+                idents = [x for x in identifiers_from_text(expr) if x != fn]
                 return {
                     "argument_expression": expr[:240],
                     "argument_identifiers": idents[:12],
                     "arg_index": arg_index,
-                    "call_text": re.sub(r"\s+", " ", blob[m.start() : end + 1])[:280],
-                    "approx_line": start,
+                    "call_text": rec["call_text"],
+                    "approx_line": rec["line"],
                 }
-        # Indirect / function-pointer call: table[i](arg0, arg1, ...)
-        blob = self._window_text(max(1, call_line - 2), call_line + 10)
-        for m in re.finditer(r"\]\s*\(", blob):
-            i = m.end() - 1
-            depth = 0
-            end = None
-            for j in range(i, len(blob)):
-                ch = blob[j]
-                if ch == "(":
-                    depth += 1
-                elif ch == ")":
-                    depth -= 1
-                    if depth == 0:
-                        end = j
-                        break
-            if end is None:
-                continue
-            args = self._split_c_args(blob[i + 1 : end])
-            if arg_index >= len(args):
-                continue
-            expr = re.sub(r"\s+", " ", args[arg_index]).strip()
-            idents = [x for x in re.findall(r"\b([A-Za-z_]\w*)\b", expr) if x != fn]
-            return {
-                "argument_expression": expr[:240],
-                "argument_identifiers": idents[:12],
-                "arg_index": arg_index,
-                "call_text": re.sub(r"\s+", " ", blob[max(0, m.start() - 40) : end + 1])[:280],
-                "approx_line": call_line,
-            }
+        # Indirect / function-pointer: any call on this line with enough args.
+        for rec in self._calls_by_line.get(call_line, []):
+            if arg_index < len(rec["args"]):
+                expr = rec["args"][arg_index]
+                idents = [x for x in identifiers_from_text(expr) if x != fn]
+                return {
+                    "argument_expression": expr[:240],
+                    "argument_identifiers": idents[:12],
+                    "arg_index": arg_index,
+                    "call_text": rec["call_text"],
+                    "approx_line": rec["line"],
+                }
         return None
 
     def _function_end_from(self, func_line: int, max_span: int = 1200) -> int:
-        """Brace-match from a candidate function start line; return end line."""
+        info = self._functions_by_start.get(func_line)
+        if info:
+            return min(info[2], func_line + max_span)
         n = len(self.source_lines) - 1
-        depth = 0
-        started = False
-        end_line = min(n, func_line + max_span)
-        for i in range(func_line, min(n, func_line + max_span) + 1):
-            for ch in self.source_lines[i]:
-                if ch == "{":
-                    depth += 1
-                    started = True
-                elif ch == "}":
-                    depth -= 1
-                    if started and depth == 0:
-                        return i
-        return end_line
+        return min(n, func_line + max_span)
 
     def _looks_like_function_header(self, line_no: int) -> Optional[str]:
-        """Return function name if ``line_no`` starts a (possibly multi-line) header."""
-        if line_no < 1 or line_no >= len(self.source_lines):
-            return None
-        text = self.source_lines[line_no].strip()
-        if not text or text.startswith(
-            ("if", "for", "while", "switch", "else", "case", "#", "}", "(", "return")
-        ):
-            return None
-        # Cast-call `(void)Foo(` and other statements are not definitions.
-        if text.startswith("(void)") or re.match(r"^\(\s*void\s*\)", text):
-            return None
-
-        # Strip GNU attributes so they are not mistaken for the function name.
-        cleaned = _ATTR_STRIP_RE.sub(" ", text)
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-
-        m = _FUNC_START_RE.match(cleaned)
-        if m and m.group(1) not in _FUNC_NAME_BLACKLIST:
-            return m.group(1)
-
-        # Same-line fallback: last identifier before the final parameter list.
-        # Avoid matching __attribute__ / casts by taking the rightmost \w+(...).
-        if "(" in cleaned:
-            candidates = list(
-                re.finditer(r"\b([A-Za-z_]\w*)\s*\([^;]*\)\s*\{?\s*$", cleaned)
-            )
-            if not candidates:
-                # Truncated long lines: name( still present without closing ')'.
-                candidates = list(
-                    re.finditer(r"\b([A-Za-z_]\w*)\s*\([^;]*$", cleaned)
-                )
-            for cm in reversed(candidates):
-                name = cm.group(1)
-                if name in _FUNC_NAME_BLACKLIST:
-                    continue
-                if name.endswith(("Type", "type", "Idx", "IterType")) and len(
-                    candidates
-                ) > 1:
-                    continue
-                # Require a body `{` after the parameter list (same or following lines).
-                # Otherwise this is a call site, not a definition.
-                after = cleaned[cm.end() :].lstrip()
-                if after.startswith("{") or after.startswith(";"):
-                    if after.startswith(";"):
-                        return None
-                    return name
-                saw_body = False
-                for j in range(line_no + 1, min(line_no + 16, len(self.source_lines))):
-                    nxt = self.source_lines[j].strip()
-                    if not nxt:
-                        continue
-                    if nxt.startswith("{"):
-                        saw_body = True
-                        break
-                    if nxt.startswith(";"):
-                        return None
-                    if nxt.startswith(")") or nxt.endswith(")"):
-                        continue
-                    if nxt.endswith("{") or "{" in nxt:
-                        saw_body = True
-                        break
-                    # Parameter continuation; keep scanning.
-                    if nxt.startswith(",") or re.match(r"^[\w\s\*]+[,)]?$", nxt):
-                        continue
-                    break
-                if saw_body:
-                    return name
-            return None
-
-        # Multi-line: Name\n( ... )\n{
-        if re.fullmatch(r"[A-Za-z_]\w*", cleaned) or re.fullmatch(
-            r"(?:static\s+|inline\s+|extern\s+)*[\w\s\*]+?\b([A-Za-z_]\w*)\s*",
-            cleaned,
-        ):
-            m2 = re.search(r"\b([A-Za-z_]\w*)\s*$", cleaned)
-            if not m2:
-                return None
-            name = m2.group(1)
-            if name in _FUNC_NAME_BLACKLIST:
-                return None
-            for j in range(line_no + 1, min(line_no + 12, len(self.source_lines))):
-                nxt = self.source_lines[j].strip()
-                if not nxt:
-                    continue
-                if nxt.startswith("(") or nxt == "(":
-                    depth = 0
-                    saw_paren_close = False
-                    for k in range(j, min(j + 40, len(self.source_lines))):
-                        for ch in self.source_lines[k]:
-                            if ch == "(":
-                                depth += 1
-                            elif ch == ")":
-                                depth -= 1
-                                if depth == 0:
-                                    saw_paren_close = True
-                            elif ch == "{" and saw_paren_close and depth == 0:
-                                return name
-                            elif ch == ";" and saw_paren_close and depth == 0:
-                                return None
-                    return None
-                break
+        info = self._functions_by_start.get(line_no)
+        if info:
+            return info[0]
         return None
 
     def find_enclosing_function(
@@ -618,295 +950,270 @@ class DataStore:
     ) -> tuple[Optional[str], int, int]:
         """Return (name, start_line, end_line) that actually contains ``line``."""
         n = len(self.source_lines) - 1
-        start = max(1, line - max_lookback)
-        for i in range(line, start - 1, -1):
-            name = self._looks_like_function_header(i)
-            if not name:
-                continue
-            end_line = self._function_end_from(i)
-            if i <= line <= end_line:
-                return name, i, end_line
+        if not self._function_spans:
+            return None, max(1, line - 20), min(n, line + 20)
+        i = bisect.bisect_right(self._fn_start_keys, line) - 1
+        while i >= 0:
+            start, end, name = self._function_spans[i]
+            if start < line - max_lookback and end < line:
+                break
+            if start <= line <= end:
+                return name, start, end
+            i -= 1
         return None, max(1, line - 20), min(n, line + 20)
 
-    def _build_declaration_index(self) -> None:
-        """Scan ``input.c`` for array/pointer declarations (structural only)."""
-        skip_prefixes = (
-            "if",
-            "for",
-            "while",
-            "switch",
-            "return",
-            "else",
-            "case",
-            "goto",
-            "#",
+    def _store_decl(self, rec: DeclarationRecord, *, prefer_size: bool = True) -> None:
+        self.declarations_all[rec.name].append(rec)
+        existing = self.declarations.get(rec.name)
+        if existing is None:
+            self.declarations[rec.name] = rec
+            return
+        if not prefer_size:
+            return
+        ex = existing.array_size
+        nw = rec.array_size
+        if (ex is None or ex == 0) and nw is not None and nw > 0:
+            self.declarations[rec.name] = rec
+        elif ex is None and nw is not None:
+            self.declarations[rec.name] = rec
+        elif existing.parse_note and not rec.parse_note and nw is not None:
+            self.declarations[rec.name] = rec
+
+    def _decl_from_array(
+        self,
+        name: str,
+        type_text: str,
+        array_node: Node,
+        line: int,
+        *,
+        is_pointer: bool,
+        init_node: Optional[Node] = None,
+        raw: str = "",
+    ) -> DeclarationRecord:
+        size, note = _eval_size_node(
+            self.source_bytes, array_node.child_by_field_name("size")
         )
-        for line_no in range(1, len(self.source_lines)):
-            raw = self.source_lines[line_no]
-            text = raw.strip()
-            if not text or text.startswith(skip_prefixes):
+        if size is None and init_node is not None:
+            counted = _count_initializer_elements(init_node)
+            if counted:
+                size = counted
+                note = "implicit size from initializer_list"
+        extra = array_node.child_by_field_name("declarator")
+        # Multi-dimensional: nested array_declarator
+        more = False
+        cur = extra
+        while cur is not None:
+            if cur.type == "array_declarator":
+                more = True
+                break
+            cur = cur.child_by_field_name("declarator") if cur.type != "identifier" else None
+        parse_note: Optional[str] = note or None
+        if more:
+            extra_note = (
+                "Multi-dimensional declarator; only first dimension token captured; "
+                "further dimensions not resolved."
+            )
+            parse_note = f"{extra_note} {note}".strip() if note else extra_note
+        declared_type = type_text or "unknown"
+        if size is not None and not parse_note:
+            declared_type = f"{declared_type}[{size}]".strip()
+        elif array_node.child_by_field_name("size") is not None:
+            tok = collapse_ws(
+                _node_text(self.source_bytes, array_node.child_by_field_name("size"))
+            )
+            declared_type = f"{declared_type}[{tok}]".strip()
+        loc = self.synth_location(line, 1)
+        return DeclarationRecord(
+            name=name,
+            raw_declaration_text=(raw or "")[:240],
+            array_size=size,
+            declared_type=declared_type,
+            is_pointer=is_pointer,
+            location=loc,
+            parse_note=parse_note,
+        )
+
+    def _harvest_field_declaration(self, node: Node, type_name: str) -> None:
+        src = self.source_bytes
+        type_text = _type_prefix(src, node)
+        raw = collapse_ws(_node_text(src, node))
+        is_ptr_type = "*" in type_text
+        for child in node.named_children:
+            if child.type in {"primitive_type", "type_identifier", "sized_type_specifier", "struct_specifier", "union_specifier", "enum_specifier"}:
                 continue
-            if text.startswith(("}", "{")):
+            array_node = _find_array_declarator(child)
+            name = _declarator_name(src, child)
+            if not name and child.type == "field_identifier":
+                name = _node_text(src, child)
+            if not name:
                 continue
-
-            for m in _ARRAY_DECL_RE.finditer(text):
-                name = m.group("name")
-                size_tok = (m.group("size") or "").strip()
-                more = m.group("more") or ""
-                left = text[: m.start("name")].strip()
-                # Skip obvious expression indexing (ptr->field[i], call(x)[i], …)
-                # but keep typedef / custom type declarators (e.g. Foo_tst Name[1u]).
-                if not left:
-                    continue
-                if left.endswith((".", "->", "(", "=", "+", "-", "/", "%", "&", ",")):
-                    continue
-                # Call-site / arg false matches: Func(&Name[0], …) or Foo(Name[i])
-                if "(" in left and not re.search(r"\(\s*\*", left):
-                    continue
-                if not left:
-                    continue
-                if left.endswith("*") and not any(
-                    k in left
-                    for k in (
-                        "uint",
-                        "sint",
-                        "int",
-                        "char",
-                        "bool",
-                        "void",
-                        "const",
-                        "static",
-                        "extern",
-                        "struct",
-                        "typedef",
-                    )
-                ):
-                    # Pointer cast / deref expression, not a declaration.
-                    if "(" in left:
-                        continue
-
-                array_size: Optional[int] = None
-                parse_note: Optional[str] = None
-                if more.strip():
-                    parse_note = (
-                        "Multi-dimensional declarator; only first dimension token "
-                        f"captured ({size_tok!r}); further dimensions not resolved."
-                    )
-                lit_size = _parse_array_size_token(size_tok)
-                if lit_size is not None:
-                    array_size = lit_size
-                    if array_size == 0:
-                        parse_note = (
-                            f"{parse_note} Literal size token {size_tok!r} parsed as 0 "
-                            "— unusual for a real array declarator; treat with caution."
-                        ).strip()
-                else:
-                    note = (
-                        f"Non-literal array size token {size_tok!r}; "
-                        "size not resolved to an integer."
-                    )
-                    parse_note = f"{parse_note} {note}".strip() if parse_note else note
-
-                is_pointer = "*" in left
-                declared_type = re.sub(r"\s+", " ", left).strip() or "unknown"
-                if array_size is not None and not parse_note:
-                    declared_type = f"{declared_type}[{array_size}]".strip()
-                elif size_tok:
-                    declared_type = f"{declared_type}[{size_tok}]".strip()
-
-                loc = self.synth_location(line_no, max(1, len(raw)))
-                rec = DeclarationRecord(
-                    name=name,
-                    raw_declaration_text=text[:240],
-                    array_size=array_size,
-                    declared_type=declared_type,
-                    is_pointer=is_pointer,
-                    location=loc,
-                    parse_note=parse_note,
+            line = child.start_point[0] + 1
+            is_ptr = is_ptr_type or child.type == "pointer_declarator"
+            if array_node is not None:
+                rec = self._decl_from_array(
+                    name,
+                    type_text,
+                    array_node,
+                    line,
+                    is_pointer=is_ptr,
+                    raw=raw,
                 )
-                self.declarations_all[name].append(rec)
-                existing = self.declarations.get(name)
-                if existing is None:
-                    self.declarations[name] = rec
-                else:
-                    # Prefer a positive literal size over missing/zero/ambiguous.
-                    ex = existing.array_size
-                    nw = rec.array_size
-                    if (ex is None or ex == 0) and nw is not None and nw > 0:
-                        self.declarations[name] = rec
-                    elif ex is None and nw is not None:
-                        self.declarations[name] = rec
-                    elif (
-                        existing.parse_note
-                        and not rec.parse_note
-                        and nw is not None
-                    ):
-                        self.declarations[name] = rec
-
-            if "*" in text and "[" not in text:
-                pm = _PTR_DECL_RE.search(text)
-                if not pm:
-                    continue
-                name = pm.group("name")
-                if name in self.declarations:
-                    continue
-                head = (pm.group("head") or "").strip()
-                if not head or "*" not in head:
-                    continue
-                if not any(
-                    k in head
-                    for k in (
-                        "uint",
-                        "sint",
-                        "int",
-                        "char",
-                        "bool",
-                        "void",
-                        "const",
-                        "static",
-                        "extern",
-                        "struct",
-                        "typedef",
+                if type_name:
+                    typed = DeclarationRecord(
+                        name=f"{type_name}.{name}",
+                        raw_declaration_text=rec.raw_declaration_text,
+                        array_size=rec.array_size,
+                        declared_type=rec.declared_type,
+                        is_pointer=rec.is_pointer,
+                        location=rec.location,
+                        parse_note=rec.parse_note,
                     )
-                ):
-                    continue
-                loc = self.synth_location(line_no, max(1, len(raw)))
+                    self.type_array_fields[type_name].append(typed)
+                    self._store_decl(typed)
+                self._store_decl(rec)
+            elif type_name:
                 rec = DeclarationRecord(
-                    name=name,
-                    raw_declaration_text=text[:240],
+                    name=f"{type_name}.{name}",
+                    raw_declaration_text=raw[:240],
                     array_size=None,
-                    declared_type=re.sub(r"\s+", " ", head).strip(),
-                    is_pointer=True,
-                    location=loc,
+                    declared_type=type_text,
+                    is_pointer=is_ptr,
+                    location=self.synth_location(line, 1),
                     parse_note=None,
                 )
-                self.declarations_all[name].append(rec)
-                self.declarations[name] = rec
+                self._store_decl(rec, prefer_size=True)
 
-        # Typedef struct/union member arrays + ``Type Name;`` object defs.
-        self._index_typedef_and_objects()
+    def _struct_tag(self, node: Node) -> str:
+        for child in node.named_children:
+            if child.type in {"type_identifier", "identifier"}:
+                return _node_text(self.source_bytes, child)
+        return ""
 
-    def _index_typedef_and_objects(self) -> None:
-        """Index ``typedef {{ ... Field[N]; }} Type;`` and ``Type Var;`` (structural)."""
-        typedef_start: Optional[int] = None
-        pending_fields: list[tuple[str, Optional[int], str, int, str]] = []
-        # field name, size, left type text, line, raw
+    def _harvest_struct(self, node: Node, typedef_name: str = "") -> None:
+        tag = self._struct_tag(node)
+        body = None
+        for child in node.named_children:
+            if child.type == "field_declaration_list":
+                body = child
+                break
+        if body is None:
+            return
+        keys = [k for k in (typedef_name, tag) if k]
+        if typedef_name and tag and typedef_name != tag:
+            keys = [typedef_name, tag]
+        if not keys:
+            return
+        for field_n in body.named_children:
+            if field_n.type == "field_declaration":
+                for key in keys:
+                    self._harvest_field_declaration(field_n, key)
 
-        for line_no in range(1, len(self.source_lines)):
-            text = self.source_lines[line_no].strip()
-            if not text:
+    def _harvest_declaration_node(self, node: Node) -> None:
+        src = self.source_bytes
+        type_text = _type_prefix(src, node)
+        raw = collapse_ws(_node_text(src, node))
+        simple_type = type_text.split()[-1].replace("*", "") if type_text else ""
+        is_ptr_type = "*" in type_text
+        for child in node.named_children:
+            init_n = None
+            decl_n = child
+            if child.type == "init_declarator":
+                decl_n = child.child_by_field_name("declarator")
+                init_n = child.child_by_field_name("value")
+            if decl_n is None:
                 continue
-
-            if re.match(r"^typedef\s+(?:struct|union)\b", text):
-                typedef_start = line_no
-                pending_fields = []
+            if decl_n.type in {
+                "primitive_type",
+                "type_identifier",
+                "sized_type_specifier",
+                "struct_specifier",
+                "union_specifier",
+                "storage_class_specifier",
+                "type_qualifier",
+            }:
                 continue
-
-            if typedef_start is not None:
-                # Member array: Type field[N];
-                for m in _ARRAY_DECL_RE.finditer(text):
-                    fname = m.group("name")
-                    size_tok = (m.group("size") or "").strip()
-                    left = text[: m.start("name")].strip()
-                    if not left or left.endswith((".", "->", "(", "=", "&")):
-                        continue
-                    if "(" in left and not re.search(r"\(\s*\*", left):
-                        continue
-                    size = _parse_array_size_token(size_tok)
-                    pending_fields.append(
-                        (fname, size, left, line_no, text[:240])
-                    )
-
-                # Closing: } TypeName;
-                cm = re.match(
-                    r"^\}\s*([A-Za-z_]\w*)(?:\s*,\s*\*?[A-Za-z_]\w*)*\s*;\s*$",
-                    text,
+            name = _declarator_name(src, decl_n)
+            if not name:
+                continue
+            line = decl_n.start_point[0] + 1
+            array_node = _find_array_declarator(decl_n)
+            is_ptr = is_ptr_type or decl_n.type == "pointer_declarator"
+            if array_node is not None:
+                rec = self._decl_from_array(
+                    name,
+                    type_text,
+                    array_node,
+                    line,
+                    is_pointer=is_ptr,
+                    init_node=init_n,
+                    raw=raw,
                 )
-                if cm:
-                    type_name = cm.group(1)
-                    for fname, size, left, fln, raw in pending_fields:
-                        left_n = re.sub(r"\s+", " ", left).strip()
-                        rec = DeclarationRecord(
-                            name=f"{type_name}.{fname}",
-                            raw_declaration_text=raw,
-                            array_size=size,
-                            declared_type=(
-                                f"{left_n}[{size}]"
-                                if size is not None
-                                else f"{left_n}[?]"
-                            ),
-                            is_pointer="*" in left,
-                            location=self.synth_location(
-                                fln, max(1, len(self.source_lines[fln]))
-                            ),
-                            parse_note=(
-                                None
-                                if size is not None
-                                else f"Non-literal member size in {type_name}.{fname}"
-                            ),
-                        )
-                        self.type_array_fields[type_name].append(rec)
-                        # Also index Type.field and bare field if unambiguous later.
-                        self.declarations_all[rec.name].append(rec)
-                        if rec.name not in self.declarations or (
-                            (self.declarations[rec.name].array_size or 0) == 0
-                            and size
-                        ):
-                            self.declarations[rec.name] = rec
-                    typedef_start = None
-                    pending_fields = []
-                    continue
-                # Abandoned typedef if we hit another top-level typedef without close
-                if text.startswith("typedef ") and "{" not in text:
-                    typedef_start = None
-                    pending_fields = []
+                self._store_decl(rec)
+                continue
+            if is_ptr:
+                rec = DeclarationRecord(
+                    name=name,
+                    raw_declaration_text=raw[:240],
+                    array_size=None,
+                    declared_type=type_text,
+                    is_pointer=True,
+                    location=self.synth_location(line, 1),
+                    parse_note=None,
+                )
+                if name not in self.declarations:
+                    self._store_decl(rec)
+            if simple_type and ident_token(simple_type) and ident_token(name):
+                if name not in self.object_types:
+                    self.object_types[name] = simple_type
 
-            # Object definition: TypeName VarName;
-            om = re.match(
-                r"^(?:static\s+|extern\s+|const\s+|volatile\s+)*"
-                r"(?:struct\s+)?([A-Za-z_]\w*)\s+([A-Za-z_]\w*)"
-                r"\s*(?:=\s*[^;]+)?;\s*$",
-                text,
-            )
-            if om:
-                typ, var = om.group(1), om.group(2)
-                if typ in {
-                    "return",
-                    "sizeof",
-                    "if",
-                    "for",
-                    "while",
-                    "switch",
-                    "goto",
-                }:
+    def _build_declaration_index(self) -> None:
+        """Walk the C AST for array/pointer/typedef field declarations."""
+        if self.source_tree is None:
+            return
+        for node in _iter_nodes(self.source_tree.root_node):
+            if node.type in {"struct_specifier", "union_specifier"}:
+                self._harvest_struct(node)
+            elif node.type == "type_definition":
+                spec = None
+                typedef_name = ""
+                for child in node.named_children:
+                    if child.type in {"struct_specifier", "union_specifier"}:
+                        spec = child
+                    elif child.type == "type_identifier":
+                        typedef_name = _node_text(self.source_bytes, child)
+                    elif "declarator" in child.type:
+                        typedef_name = _declarator_name(self.source_bytes, child) or typedef_name
+                if spec is not None:
+                    self._harvest_struct(spec, typedef_name)
+        for node in _iter_nodes(self.source_tree.root_node):
+            if node.type == "declaration":
+                self._harvest_declaration_node(node)
+        # Copy typedef array fields onto object instances: Type var;
+        for var, typ in list(self.object_types.items()):
+            for frec in self.type_array_fields.get(typ, []):
+                field = frec.name.split(".")[-1]
+                qname = f"{var}.{field}"
+                if qname in self.declarations and self.declarations[qname].array_size:
                     continue
-                if var not in self.object_types:
-                    self.object_types[var] = typ
-                # If Type has array fields, expose Var.field declarations.
-                for frec in self.type_array_fields.get(typ, []):
-                    field = frec.name.split(".")[-1]
-                    qname = f"{var}.{field}"
-                    qrec = DeclarationRecord(
-                        name=qname,
-                        raw_declaration_text=frec.raw_declaration_text,
-                        array_size=frec.array_size,
-                        declared_type=frec.declared_type,
-                        is_pointer=frec.is_pointer,
-                        location=frec.location,
-                        parse_note=(
-                            f"Array member of {typ} object {var}; "
-                            f"from typedef field {frec.name}."
-                        ),
-                    )
-                    self.declarations_all[qname].append(qrec)
-                    self.declarations[qname] = qrec
+                qrec = DeclarationRecord(
+                    name=qname,
+                    raw_declaration_text=frec.raw_declaration_text,
+                    array_size=frec.array_size,
+                    declared_type=frec.declared_type,
+                    is_pointer=frec.is_pointer,
+                    location=frec.location,
+                    parse_note=(
+                        f"Array member of {typ} object {var}; "
+                        f"from typedef field {frec.name}."
+                    ),
+                )
+                self._store_decl(qrec)
 
     def get_declaration(self, symbol_name: str) -> Optional[DeclarationRecord]:
         key = (symbol_name or "").strip().split("@", 1)[0].strip('"')
         hit = self.declarations.get(key)
         if hit is not None:
             return hit
-        # Struct.Field → try Type.field via object type, then bare field.
         if "." in key:
             obj, field = key.split(".", 1)
             typ = self.object_types.get(obj)
@@ -930,17 +1237,16 @@ class DataStore:
                 "nested_array_fields": [],
             }
 
-        # Object with nested array fields (union/struct instance).
         typ = self.object_types.get(key)
         if typ:
             fields = list(self.type_array_fields.get(typ, []))
-            # Also pick up Var.field entries already indexed.
             for name, drec in self.declarations.items():
                 if name.startswith(key + ".") and drec.array_size is not None:
-                    if not any(f.name == name or f.name.endswith("." + name.split(".")[-1]) for f in fields):
+                    if not any(
+                        f.name == name or f.name.endswith("." + name.split(".")[-1])
+                        for f in fields
+                    ):
                         fields.append(drec)
-            # Fallback: if typedef array members were not indexed, infer member
-            # candidates from declaration/data-flow keys (e.g. obj.raw).
             if not fields:
                 seen_member: set[str] = set()
                 for name in self.declarations:
@@ -950,18 +1256,7 @@ class DataStore:
                     if not member or member in seen_member:
                         continue
                     seen_member.add(member)
-                    drec = self.declarations[name]
-                    fields.append(
-                        DeclarationRecord(
-                            name=name,
-                            raw_declaration_text=drec.raw_declaration_text,
-                            array_size=drec.array_size,
-                            declared_type=drec.declared_type,
-                            is_pointer=drec.is_pointer,
-                            location=drec.location,
-                            parse_note=drec.parse_note,
-                        )
-                    )
+                    fields.append(self.declarations[name])
                 for df_name in self.data_flow_by_variable:
                     if not df_name.startswith(key + "."):
                         continue
@@ -1013,7 +1308,6 @@ class DataStore:
                 "nested_array_fields": [],
             }
 
-        # Qualified path not found as array — try object.field suggestions.
         nested: list[DeclarationRecord] = []
         if "." not in key and key in self.object_types:
             nested = list(self.type_array_fields.get(self.object_types[key], []))
@@ -1027,7 +1321,6 @@ class DataStore:
 
     @staticmethod
     def _symbol_name_forms(variable_name: str) -> dict[str, Optional[str]]:
-        """Bare / qualified / parent forms for DF + source matching."""
         full = (variable_name or "").strip().split("@", 1)[0].strip('"')
         tail = full.split(".")[-1] if full else ""
         parent = full.rsplit(".", 1)[0] if "." in full else None
@@ -1040,15 +1333,6 @@ class DataStore:
         *,
         function_scope: Optional[str] = None,
     ) -> list[DataFlowRecord]:
-        """Return DF write events to ``variable_name`` with line strictly before
-        ``before_location``. Optionally restrict to one function name.
-
-        Matches bare name and qualified ``name@scope`` DF keys. For
-        ``Struct.Field`` queries, also considers parent-struct DF writes whose
-        assignment text mentions that field (Astrée DF often keys only the
-        aggregate). Structural filter only — no reachability judgment beyond
-        line order.
-        """
         forms = self._symbol_name_forms(variable_name)
         bare = forms["full"] or ""
         before_line = self.parse_location_line(before_location)
@@ -1078,7 +1362,6 @@ class DataStore:
                             if rec.line
                             else ""
                         )
-                        # Also accept lines that mention Struct.Field / ->Field.
                         line_txt = (
                             self.source_lines[rec.line]
                             if rec.line and rec.line < len(self.source_lines)
@@ -1088,7 +1371,7 @@ class DataStore:
                         if not (
                             f".{field}" in line_txt
                             or f"->{field}" in line_txt
-                            or re.search(rf"\b{re.escape(field)}\b", line_txt)
+                            or token_in_text(line_txt, field)
                         ):
                             continue
                         if not (
@@ -1098,7 +1381,6 @@ class DataStore:
                             or f".{field}++" in line_txt
                             or f"->{field}++" in line_txt
                         ):
-                            # Parent aggregate write unrelated to this field.
                             if field not in (expr or line_txt):
                                 continue
                     sig = (rec.variable, rec.function, rec.location, rec.line, rec.process)
@@ -1107,12 +1389,10 @@ class DataStore:
                     seen.add(sig)
                     out.append(rec)
 
-        # Query bare + any qualified keys that share the bare prefix.
         keys = {bare}
         for k in self.data_flow_by_variable:
             if k == bare or k.startswith(bare + "@"):
                 keys.add(k)
-        # Also try field tail alone.
         tail = forms["tail"]
         if tail and tail != bare:
             keys.add(tail)
@@ -1121,7 +1401,6 @@ class DataStore:
                     keys.add(k)
         _add_from_keys(keys)
 
-        # Parent aggregate DF rows filtered to this field (common Astrée pattern).
         parent = forms["parent"]
         if parent and tail:
             parent_keys = {parent}
@@ -1134,7 +1413,6 @@ class DataStore:
         return out
 
     def extract_assignment_text(self, line: int, variable_name: str) -> str:
-        """Return source text mentioning an assignment involving ``variable_name``."""
         if line < 1 or line >= len(self.source_lines):
             return ""
         bare = variable_name.split("@", 1)[0].strip('"')
@@ -1148,6 +1426,21 @@ class DataStore:
                 return text[:300]
         return self.source_lines[line].strip()[:300]
 
+    def _lhs_matches(self, lhs: str, full: str, tail: str) -> bool:
+        compact = collapse_ws(lhs).replace("->", ".").replace(" ", "")
+        if not compact:
+            return False
+        if full and (compact == full.replace("->", ".") or compact.endswith("." + full.split(".")[-1])):
+            if compact == full.replace(" ", "") or compact.endswith("." + tail) or compact == tail:
+                return True
+        if tail and (compact == tail or compact.endswith("." + tail)):
+            return True
+        if full and "." in full:
+            root, field = full.rsplit(".", 1)
+            if compact == f"{root}.{field}" or compact.endswith(f".{field}"):
+                return True
+        return False
+
     def find_source_assignments(
         self,
         variable_name: str,
@@ -1156,76 +1449,32 @@ class DataStore:
         function_start: int,
         function_end: int,
     ) -> list[dict]:
-        """Scan source in a function span for assignments/initializers to a name.
-
-        Retrieval only — returns matching lines before ``before_line``.
-        Supports bare names and ``Struct.Field`` / ``Struct->Field`` forms.
-        """
         forms = self._symbol_name_forms(variable_name)
         full = forms["full"] or ""
         tail = forms["tail"] or full
-        targets = []
-        if full:
-            targets.append(full)
-        if tail and tail not in targets:
-            targets.append(tail)
-        patterns: list[re.Pattern[str]] = []
-        for name in targets:
-            esc = re.escape(name)
-            patterns.extend(
-                [
-                    re.compile(rf"(?:->|\.){re.escape(tail)}\s*=(?!=)")
-                    if name == full and "." in full
-                    else re.compile(rf"\b{esc}\s*=(?!=)"),
-                    re.compile(rf"(?:->|\.){re.escape(tail)}\s*\+\+"),
-                    re.compile(rf"(?:->|\.){re.escape(tail)}\s*--"),
-                    re.compile(rf"\b{esc}\s*\+\+"),
-                    re.compile(rf"\b{esc}\s*--"),
-                    re.compile(rf"\b{esc}\s*[+\-*/&|^%]?="),
-                ]
-            )
-            if "." in name:
-                # Explicit Struct.Field / Struct->Field
-                root, field = name.rsplit(".", 1)
-                patterns.append(
-                    re.compile(
-                        rf"\b{re.escape(root)}\s*(?:\.|->)\s*{re.escape(field)}\s*=(?!=)"
-                    )
-                )
-                patterns.append(
-                    re.compile(
-                        rf"\b{re.escape(root)}\s*(?:\.|->)\s*{re.escape(field)}\s*\+\+"
-                    )
-                )
-                patterns.append(
-                    re.compile(
-                        rf"\b{re.escape(root)}\s*(?:\.|->)\s*{re.escape(field)}\s*--"
-                    )
-                )
-
         hits: list[dict] = []
         lo = max(1, function_start)
         hi = min(before_line - 1, function_end, len(self.source_lines) - 1)
-        for ln in range(lo, hi + 1):
-            text = self.source_lines[ln].strip()
-            if not text:
+        for rec in self._assigns:
+            ln = rec["line"]
+            if ln < lo:
                 continue
-            if tail not in text and full not in text:
+            if ln > hi:
+                break
+            if not self._lhs_matches(rec["lhs"], full, tail):
                 continue
-            if any(p.search(text) for p in patterns):
-                hits.append(
-                    {
-                        "function": None,  # filled by caller
-                        "location": self.synth_location(
-                            ln, max(1, len(self.source_lines[ln]))
-                        ),
-                        "line": ln,
-                        "process": None,
-                        "assigned_expression_text": text[:300],
-                        "call_depth": 0,
-                        "source": "source_scan",
-                    }
-                )
+            text = rec["text"] or self.source_lines[ln].strip()[:300]
+            hits.append(
+                {
+                    "function": None,
+                    "location": self.synth_location(ln, max(1, len(self.source_lines[ln]))),
+                    "line": ln,
+                    "process": None,
+                    "assigned_expression_text": text[:300],
+                    "call_depth": 0,
+                    "source": "source_scan",
+                }
+            )
         return hits
 
     def find_source_assignments_global(
@@ -1235,12 +1484,6 @@ class DataStore:
         before_line: int,
         max_hits: int = 40,
     ) -> list[dict]:
-        """File-wide source assignment scan when DF has no field-level keys.
-
-        Retrieval only — capped. Prefer path-local ``find_source_assignments``
-        when a function span is known. Skipped for generic names like ``Index``
-        / ``i`` that would cross-contaminate unrelated functions.
-        """
         forms = self._symbol_name_forms(variable_name)
         full = forms["full"] or ""
         tail = forms["tail"] or full
@@ -1250,42 +1493,20 @@ class DataStore:
             return []
         if len(tail) <= 2:
             return []
-        patterns: list[re.Pattern[str]] = [
-            re.compile(rf"(?:->|\.)\s*{re.escape(tail)}\s*=(?!=)"),
-            re.compile(rf"(?:->|\.)\s*{re.escape(tail)}\s*\+\+"),
-            re.compile(rf"(?:->|\.)\s*{re.escape(tail)}\s*--"),
-            re.compile(rf"\b{re.escape(tail)}\s*=(?!=)"),
-            re.compile(rf"\b{re.escape(tail)}\s*\+\+"),
-            re.compile(rf"\b{re.escape(tail)}\s*--"),
-        ]
-        if full and "." in full:
-            root, field = full.rsplit(".", 1)
-            patterns.append(
-                re.compile(
-                    rf"\b{re.escape(root)}\s*(?:\.|->)\s*{re.escape(field)}\s*=(?!=)"
-                )
-            )
-            patterns.append(
-                re.compile(
-                    rf"\b{re.escape(root)}\s*(?:\.|->)\s*{re.escape(field)}\s*\+\+"
-                )
-            )
-
         hits: list[dict] = []
         hi = min(before_line - 1, len(self.source_lines) - 1)
-        for ln in range(hi, 0, -1):
-            text = self.source_lines[ln].strip()
-            if not text or tail not in text:
+        for rec in reversed(self._assigns):
+            ln = rec["line"]
+            if ln > hi or ln < 1:
                 continue
-            if not any(p.search(text) for p in patterns):
+            if not self._lhs_matches(rec["lhs"], full, tail):
                 continue
             fn, _, _ = self.find_enclosing_function(ln)
+            text = rec["text"] or self.source_lines[ln].strip()[:300]
             hits.append(
                 {
                     "function": fn,
-                    "location": self.synth_location(
-                        ln, max(1, len(self.source_lines[ln]))
-                    ),
+                    "location": self.synth_location(ln, max(1, len(self.source_lines[ln]))),
                     "line": ln,
                     "process": None,
                     "assigned_expression_text": text[:300],
@@ -1306,15 +1527,7 @@ class DataStore:
         max_depth: int = 8,
         max_guards: int = 40,
     ) -> dict:
-        """Find if/switch/assert/ternary conditions mentioning ``variable_name``.
-
-        Walks CF callers, scanning source
-        in each visited function for conditional text before ``from_location``
-        (or before each call-site location). Retrieval only — does not judge
-        whether a guard prevents the access.
-        """
         bare = (variable_name or "").strip().split("@", 1)[0].strip('"')
-        # Also match bare field: foo.bar → bar
         tokens = {bare, bare.split(".")[-1]}
         tokens = {t for t in tokens if t}
         target_line = self.parse_location_line(from_location)
@@ -1328,9 +1541,9 @@ class DataStore:
 
         depth_lim = max(0, min(int(max_depth), 32))
         start_fn, fn_start, fn_end = self.find_enclosing_function(target_line)
-        queue: list[
-            tuple[Optional[str], int, Optional[int], Optional[int], str]
-        ] = [(start_fn, 0, fn_start, fn_end, from_location)]
+        queue: list[tuple[Optional[str], int, Optional[int], Optional[int], str]] = [
+            (start_fn, 0, fn_start, fn_end, from_location)
+        ]
         seen_fns: set[Optional[str]] = set()
         guards: list[dict] = []
         truncated = False
@@ -1368,12 +1581,10 @@ class DataStore:
                         depth + 1,
                         c_start,
                         c_end,
-                        edge.call_site
-                        or self.synth_location(c_line),
+                        edge.call_site or self.synth_location(c_line),
                     )
                 )
 
-        # De-dupe by location + text
         uniq: list[dict] = []
         seen_g: set[tuple] = set()
         for g in guards:
@@ -1404,74 +1615,30 @@ class DataStore:
         hits: list[dict] = []
         lo = max(1, start)
         hi = min(end, len(self.source_lines) - 1)
-        # Multi-line if: accumulate when an if( opens without ) on same line.
-        pending: Optional[dict] = None
-        for ln in range(lo, hi + 1):
-            raw = self.source_lines[ln]
-            text = raw.strip()
-            if not text or text.startswith("#"):
+        for rec in self._guards:
+            ln = rec["line"]
+            if ln < lo:
                 continue
-            combined = text
-            kind = None
-            if pending:
-                pending["lines"].append(text)
-                pending["end_line"] = ln
-                blob = " ".join(pending["lines"])
-                if blob.count("(") <= blob.count(")"):
-                    combined = blob
-                    kind = pending["kind"]
-                    start_line = pending["start_line"]
-                    pending = None
-                else:
-                    continue
-            else:
-                start_line = ln
-                if re.search(r"\belse\s+if\b\s*\(", text) or re.search(
-                    r"\bif\s*\(", text
-                ):
-                    kind = "if"
-                elif re.search(r"\bswitch\s*\(", text):
-                    kind = "switch"
-                elif re.search(r"\bfor\s*\(", text):
-                    kind = "for"
-                elif re.search(r"\bwhile\s*\(", text):
-                    kind = "while"
-                elif re.search(r"\bassert\s*\(", text) or re.search(
-                    r"\bASSERT\s*\(", text
-                ):
-                    kind = "assert"
-                elif "?" in text and ":" in text:
-                    kind = "ternary"
-                else:
-                    continue
-                # Multi-line condition
-                if kind in {"if", "switch", "assert", "for", "while"} and text.count(
-                    "("
-                ) > text.count(")"):
-                    pending = {
-                        "kind": kind,
-                        "start_line": ln,
-                        "end_line": ln,
-                        "lines": [text],
-                    }
-                    continue
-
-            if kind is None:
+            if ln > hi:
+                break
+            cond = rec["condition"]
+            if not any(token_in_text(cond, tok) for tok in tokens):
                 continue
-            if not any(re.search(rf"\b{re.escape(tok)}\b", combined) for tok in tokens):
-                continue
-            # Keep a compact condition text (first ~240 chars).
-            cond = re.sub(r"\s+", " ", combined).strip()[:240]
             hits.append(
                 {
                     "condition_text": cond,
-                    "kind": kind,
+                    "kind": rec["kind"],
                     "function": function,
                     "location": self.synth_location(
-                        start_line, max(1, len(self.source_lines[start_line]))
+                        ln, max(1, len(self.source_lines[ln]) if ln < len(self.source_lines) else 1)
                     ),
-                    "line": start_line,
+                    "line": ln,
                     "call_depth": call_depth,
                 }
             )
         return hits
+
+    def subscripts_on_line(self, line: int) -> list[dict[str, Any]]:
+        if line < 1 or line >= len(self.source_lines):
+            return []
+        return subscripts_from_text(self.source_lines[line])

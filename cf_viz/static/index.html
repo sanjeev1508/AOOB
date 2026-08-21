@@ -428,6 +428,26 @@
       background: rgba(18,181,163,0.15); color: var(--accent);
     }
     .seq-toggle-btn:not(:last-child) { border-right: 1px solid var(--line); }
+    .typing { color: var(--muted); font-size: 0.88rem; }
+    .typing-dots span {
+      display: inline-block;
+      animation: typingPulse 1.2s infinite;
+      opacity: 0.2;
+    }
+    .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
+    .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
+    @keyframes typingPulse {
+      0%, 80%, 100% { opacity: 0.2; }
+      40% { opacity: 1; }
+    }
+    .path-meta { overflow-x: auto; margin-top: 0.35rem; }
+    .path-meta table { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
+    .path-meta th, .path-meta td {
+      padding: 0.22rem 0.35rem; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap;
+    }
+    .path-meta th { color: var(--muted); font-weight: 600; }
+    .tool-summary details { margin-top: 0.3rem; }
+    .tool-summary summary { cursor: pointer; color: var(--muted); font-size: 0.75rem; }
   </style>
 </head>
 <body>
@@ -475,7 +495,7 @@
       <div id="hud">
         <button class="secondary" id="btn-fit" type="button">Fit</button>
         <button class="secondary" id="btn-first" type="button" disabled>Expand first access</button>
-        <button class="secondary" id="btn-seq-fit" type="button" disabled>Focus sequence</button>
+        <button class="secondary" id="btn-seq-fit" type="button" disabled>Zoom to path</button>
       </div>
     </section>
 
@@ -500,8 +520,9 @@
         </div>
       </div>
       <div class="legend">
+        <div><i style="background:#fb923c"></i>Origin · <i style="background:#c084fc"></i>Hop · <i style="background:#f43f5e"></i>Alarm</div>
         <div><i style="background:#38bdf8"></i>Read · <i style="background:#fb923c"></i>Write · <i style="background:#c084fc"></i>Mixed</div>
-        <div><i style="background:#f43f5e"></i>Alarm on sequence · <i style="background:#5eead4"></i>Expanded neighbor · <i style="background:#2a354d"></i>Dimmed CF</div>
+        <div><i style="background:#5eead4"></i>Expanded neighbor · <i style="background:#2a354d"></i>Dimmed (off path)</div>
       </div>
     </aside>
   </div>
@@ -523,6 +544,8 @@
       pathEdge: "#94a3b8",
       directEdge: "#e2e8f0",
       label: "#e8edf7",
+      origin: "#fb923c",
+      hop: "#c084fc",
       alarm: "#f43f5e",
       expand: "#5eead4",
     };
@@ -660,7 +683,12 @@
         tip.style.display = "block";
         tip.style.left = `${coords.x + 14}px`;
         tip.style.top = `${coords.y + 14}px`;
-        tip.textContent = node;
+        const roles = lastHighlight?.function_roles || {};
+        const onPath = Boolean(roles[node]) || (lastHighlight?.highlight_nodes || []).includes(node);
+        const role = roles[node] || (onPath ? "path" : "off-path");
+        tip.textContent = onPath
+          ? `${node} · on path (${role})`
+          : `${node} · not on current path`;
       });
       renderer.on("leaveNode", () => { tip.style.display = "none"; });
       renderer.on("clickNode", ({ node, event }) => {
@@ -702,7 +730,7 @@
           graph.setEdgeAttribute(id, "hidden", false);
           if (isPath) {
             graph.setEdgeAttribute(id, "color", direct.has(id) ? C.directEdge : C.pathEdge);
-            graph.setEdgeAttribute(id, "size", (attrs.originalSize || 1) * 2.2);
+            graph.setEdgeAttribute(id, "size", (attrs.originalSize || 1) * 3.4);
             graph.setEdgeAttribute(id, "zIndex", 2);
           } else if (isExpand) {
             graph.setEdgeAttribute(id, "color", C.expand);
@@ -722,7 +750,7 @@
         if (isPath) {
           graph.setEdgeAttribute(id, "hidden", false);
           graph.setEdgeAttribute(id, "color", direct.has(id) ? C.directEdge : C.pathEdge);
-          graph.setEdgeAttribute(id, "size", (attrs.originalSize || 1) * 2.4);
+          graph.setEdgeAttribute(id, "size", (attrs.originalSize || 1) * 3.6);
           graph.setEdgeAttribute(id, "zIndex", 2);
         } else if (lastHighlight && isExpand) {
           graph.setEdgeAttribute(id, "hidden", false);
@@ -999,11 +1027,19 @@
       el("btn-seq-fit").disabled = activeSeq.length === 0;
       el("btn-first").disabled = !firstFn;
 
+      const fnRoles = payload.function_roles || {};
       graph.forEachNode((id, attrs) => {
         if (activeSeqSet.has(id)) {
           const step = activeSeq.indexOf(id) + 1;
+          const role = fnRoles[id] || "";
           const kind = fnAccess[id] || "other";
-          const color = accessColor(kind);
+          const color = role === "alarm" || role === "origin_and_alarm"
+            ? C.alarm
+            : role === "origin"
+              ? C.origin
+              : role === "hop"
+                ? C.hop
+                : accessColor(kind);
           const isFirst = id === firstFn;
           const isFocus = id === focusedNode;
           graph.setNodeAttribute(id, "color", color);
@@ -1028,7 +1064,7 @@
           graph.setNodeAttribute(id, "zIndex", 2);
         } else {
           graph.setNodeAttribute(id, "color", C.dim);
-          graph.setNodeAttribute(id, "size", Math.max(1, (attrs.originalSize || 2) * 0.55));
+          graph.setNodeAttribute(id, "size", Math.max(0.8, (attrs.originalSize || 2) * 0.35));
           graph.setNodeAttribute(id, "label", alwaysLabels ? id : "");
           graph.setNodeAttribute(id, "forceLabel", false);
           graph.setNodeAttribute(id, "zIndex", 0);
@@ -1139,54 +1175,152 @@
         </details>`;
     }
 
+    let liveStatusEl = null;
+    let pendingToolName = null;
+
+    function typingHtml(label) {
+      return `<span class="typing">${esc(label)}<span class="typing-dots"><span>.</span><span>.</span><span>.</span></span></span>`;
+    }
+
+    function setLiveStatus(label) {
+      if (!liveStatusEl || !liveStatusEl.isConnected) {
+        liveStatusEl = appendBubble(typingHtml(label), "status");
+        liveStatusEl.classList.add("live-status");
+      } else {
+        liveStatusEl.innerHTML = typingHtml(label);
+        scrollChat();
+      }
+      return liveStatusEl;
+    }
+
+    function clearLiveStatus() {
+      if (liveStatusEl && liveStatusEl.isConnected) {
+        liveStatusEl.remove();
+      }
+      liveStatusEl = null;
+    }
+
+    function toolResultSummary(name, preview) {
+      let parsed = null;
+      try { parsed = JSON.parse(preview || ""); } catch (_) { parsed = null; }
+      if (name === "move_window") {
+        const step = parsed?.moved_to_step;
+        const fn = parsed?.function || "";
+        const role = parsed?.role || "";
+        return `✓ move_window — step ${step ?? "?"} · ${esc(fn)} [${esc(role)}]`;
+      }
+      const fn = parsed?.function_name || parsed?.helper || parsed?.function || "";
+      const n = parsed?.line_count ?? (Array.isArray(parsed?.snippet) ? parsed.snippet.length : null);
+      if (name === "submit_verdict") {
+        const ok = parsed?.accepted;
+        const cls = parsed?.verdict?.classification || "";
+        return ok
+          ? `✓ submit_verdict — ${esc(cls)}`
+          : `✗ submit_verdict rejected — ${esc(parsed?.error || "rejected")}`;
+      }
+      const bits = [name];
+      if (fn) bits.push(fn);
+      if (n != null) bits.push(`${n} lines`);
+      return `✓ ${esc(bits.join(" — "))}`;
+    }
+
+    function renderPathMeta(ev) {
+      const steps = ev.steps || [];
+      const rows = steps.map((s) => `
+        <tr>
+          <td>${esc(s.sequence ?? s.step)}</td>
+          <td class="mono">${esc(s.function)}</td>
+          <td>${esc(s.role)}</td>
+          <td class="mono">${esc(s.symbol)}</td>
+          <td>${esc(s.scope)}</td>
+          <td>${esc(s.access)}</td>
+          <td>${s.declared_size == null ? "unknown" : esc(s.declared_size)}</td>
+          <td class="mono">${esc(s.datatype || "—")}</td>
+          <td>${s.line == null ? "—" : esc(s.line)}</td>
+          <td>${s.first_access ? "yes" : ""}</td>
+        </tr>`).join("");
+      return `
+        <div class="tag">Path context</div>
+        <div>${esc(ev.indexed_object || "")} · size ${ev.declared_size == null ? "unknown" : esc(ev.declared_size)} · operand ${esc(ev.operand || "")}</div>
+        <div class="path-meta">
+          <table>
+            <thead><tr>
+              <th>#</th><th>function</th><th>role</th><th>symbol</th><th>scope</th>
+              <th>access</th><th>size</th><th>dtype</th><th>line</th><th>first</th>
+            </tr></thead>
+            <tbody>${rows || "<tr><td colspan=10>empty path</td></tr>"}</tbody>
+          </table>
+        </div>`;
+    }
+
     function handleStreamEvent(ev) {
       switch (ev.type) {
-        case "status":
-          // Keep a single live heartbeat bubble instead of spamming the log.
-          if (String(ev.message || "").startsWith("Still waiting on the NVIDIA")) {
-            let hb = el("chat-log").querySelector(".bubble.heartbeat");
-            if (!hb) {
-              hb = appendBubble(esc(ev.message), "status");
-              hb.classList.add("heartbeat");
-            } else {
-              hb.textContent = ev.message;
-              scrollChat();
-            }
-          } else {
-            appendBubble(esc(ev.message), "status");
+        case "path_meta":
+          appendBubble(renderPathMeta(ev), "system");
+          setLiveStatus("Agent reasoning");
+          break;
+        case "status": {
+          const msg = String(ev.message || "");
+          if (msg.startsWith("Still waiting")) break;
+          if (msg.startsWith("Calling ")) {
+            setLiveStatus("Agent reasoning");
+            break;
           }
+          if (msg.startsWith("Starting investigation") || msg.startsWith("Case compiled")) {
+            appendBubble(esc(msg), "status");
+            break;
+          }
+          if (msg.startsWith("Model requested")) {
+            break;
+          }
+          appendBubble(esc(msg), "status");
           break;
+        }
         case "tool_call":
-          appendBubble(
-            `<div class="tag">Tool call · ${esc(ev.name)}</div>
-             <pre class="mono">${esc(JSON.stringify(ev.args || {}, null, 2))}</pre>`,
-            "tool-call"
-          );
+          pendingToolName = ev.name || "tool";
+          setLiveStatus(`Calling tool: ${pendingToolName}`);
           break;
-        case "tool_result":
-          appendBubble(
-            `<div class="tag">Tool result · ${esc(ev.name)}</div>
-             <pre class="mono">${esc(ev.preview || "")}</pre>`,
-            "tool-result"
-          );
+        case "tool_result": {
+          const name = ev.name || pendingToolName || "tool";
+          pendingToolName = null;
+          const summary = toolResultSummary(name, ev.preview);
+          const details = esc(ev.preview || "");
+          if (liveStatusEl && liveStatusEl.isConnected) {
+            liveStatusEl.classList.remove("live-status");
+            liveStatusEl.className = "bubble tool-result";
+            liveStatusEl.innerHTML = `<div class="tool-summary">${summary}
+              <details><summary>view details</summary><pre class="mono">${details}</pre></details></div>`;
+            liveStatusEl = null;
+            scrollChat();
+          } else {
+            appendBubble(
+              `<div class="tool-summary">${summary}
+                <details><summary>view details</summary><pre class="mono">${details}</pre></details></div>`,
+              "tool-result"
+            );
+          }
+          setLiveStatus("Agent reasoning");
           break;
+        }
         case "agent":
-          appendBubble(
-            `<div class="tag">Reasoning</div>${esc(ev.content)}`,
-            "agent"
-          );
+          setLiveStatus("Agent reasoning");
+          break;
+        case "agent_input":
           break;
         case "report":
+          clearLiveStatus();
           appendBubble(renderReport(ev.data || {}), "report");
           break;
         case "error":
+          clearLiveStatus();
           appendBubble(`<strong>Error</strong> · ${esc(ev.message)}`, "error");
           break;
         case "done":
+          clearLiveStatus();
           appendBubble(`Investigation complete for Order <span class="mono">${esc(ev.order_id)}</span>.`, "status");
           break;
         default:
-          appendBubble(`<pre class="mono">${esc(JSON.stringify(ev))}</pre>`, "system");
+          break;
       }
     }
 
@@ -1242,6 +1376,7 @@
       el("chat-input").value = "";
       appendBubble(`Investigate Order <span class="mono">${esc(orderId)}</span>`, "user");
       setHint(`Investigating Order ${orderId}…`);
+      setLiveStatus("Agent reasoning");
 
       const highlightPromise = runHighlight(orderId)
         .then((data) => {
