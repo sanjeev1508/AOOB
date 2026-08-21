@@ -21,6 +21,8 @@ class CaseSession:
         self.inspected: set[str] = set()
         self.verdict: Optional[dict] = None
         self.size_unknown_retries = 0
+        self.write_gate_rejections = 0
+        self.review_contradiction_rejections = 0
 
     @property
     def n_steps(self) -> int:
@@ -56,6 +58,35 @@ class CaseSession:
     def can_inspect(self, name: str) -> bool:
         n = (name or "").strip()
         return bool(n) and n in set(self.case.helpers)
+
+    def can_inspect_declaration(self, symbol_name: str) -> bool:
+        """Declarations reachable via inspect_declaration().
+
+        Scoped to symbols the case file already names — the indexed object,
+        the operand, and anything mentioned in an extracted guard — so this
+        stays an evidence tool, not a free walk of every global in the TU.
+        """
+        n = (symbol_name or "").strip()
+        if not n:
+            return False
+        allowed = {self.case.indexed_object.name, self.case.operand_symbol}
+        for g in self.case.guards:
+            if n in g:
+                allowed.add(n)
+                break
+        return n in allowed
+
+    def pending_write_helpers(self) -> list[str]:
+        """Operand-mutating helpers not yet opened via inspect().
+
+        These are the functions that actually decide whether the index can
+        exceed capacity (they write the operand before the alarm access),
+        as opposed to helpers that merely read it inside the index
+        expression. A true/false verdict formed without looking at these is
+        an over-generalization from an unrelated helper's body, not a
+        verdict about this alarm.
+        """
+        return [h for h in self.case.write_helpers if h not in self.inspected]
 
 
 def begin_session(case: CaseFile) -> CaseSession:

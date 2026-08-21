@@ -37,15 +37,32 @@ Tools:
 - move_window(direction="next"|"prev", step=0) — navigate the path only
   (no source). Call get_window afterwards if you need that step's code.
 - inspect(function_name) — complete helper function body, only helpers listed
-  on the case file.
+  on the case file. This includes functions that only read the operand
+  (used inside the index expression) AND functions that write/mutate the
+  operand before the alarm access — both are listed together, and both may
+  matter, but a write-helper is the one that actually decides whether the
+  index can exceed capacity.
+- inspect_declaration(symbol_name) — the indexed object's or operand's own
+  declaration/initializer text. Use this when a guard's truth depends on a
+  specific slot's literal contents (e.g. "is index N always the sentinel
+  entry?"), not just on control flow you can already see.
 - submit_verdict(classification, comment, confidence) — true | false | review.
   This is the terminal call. You MUST call it to finish.
   If declared size is unknown, classification must be review, not true/false.
+  If a helper that writes the operand hasn't been inspected yet, this
+  applies to review too, not just true/false — call inspect() on it first,
+  even if you only expect to end up at review. If the body turns out to be
+  unresolvable, inspect() will tell you, and review becomes submittable.
+  Naming an uninspected helper in your comment is not a substitute for
+  calling inspect() on it.
 
 Rules:
 - Use Python-extracted guards and origin inits. Nearby if() is not a bound unless listed.
 - Astrée [lo, hi] is abstract. Forbidden: array_size < Astrée hi ⇒ true.
 - if/for guards or a listed constant origin init that keeps the index inside capacity ⇒ false.
+- A helper with no internal bounds check does not by itself make the alarm
+  true — check whether the *caller's* loop/guard structure already keeps
+  that helper's inputs inside capacity before it's ever called.
 - Index can exceed capacity and no extracted guard/init ⇒ true (medium unless origin is traced).
 - Missing size/origin/allocation ⇒ review.
 """
@@ -266,6 +283,28 @@ def _count_tool_messages(messages: list) -> int:
     return sum(1 for m in messages if isinstance(m, ToolMessage))
 
 
+# Tools that return actual source/declaration text, as opposed to
+# move_window (state transition only, no source) or submit_verdict
+# (terminal, no evidence). A verdict formed without ever calling one of
+# these is a verdict formed without reading any code.
+_SOURCE_OPENING_TOOLS = frozenset({"get_window", "inspect", "inspect_declaration"})
+
+
+def _window_opened(messages: list) -> bool:
+    """Did the agent ever actually view source before its verdict?
+
+    Gates evidence_completeness downstream in _fill_report_from_case: a
+    verdict reached without opening any window/helper/declaration can't
+    honestly be "fully traced", and a "false" reached that way is
+    downgraded to "review" rather than reported as a bounded access nobody
+    checked.
+    """
+    return any(
+        isinstance(m, ToolMessage) and getattr(m, "name", None) in _SOURCE_OPENING_TOOLS
+        for m in messages
+    )
+
+
 def _tool_names_used(messages: list) -> set[str]:
     names: set[str] = set()
     for m in messages:
@@ -308,8 +347,18 @@ def _verdict_reject_count(messages: list) -> int:
     return n
 
 
-def _max_tool_budget(path_len: int) -> int:
-    return max(4, path_len + 2)
+def _max_tool_budget(path_len: int, helpers_count: int = 0, rejections: int = 0) -> int:
+    """Tool-call ceiling before the agent is forced to report.
+
+    Must cover: one get_window per path step, one inspect() per case helper
+    (index-reader or operand-writer), and room for a rejected submit_verdict
+    to be followed by the corrective inspect() it asked for. A rejection is
+    the pipeline telling the agent to do one more specific thing — it must
+    not spend the agent's last remaining call, or every rejection becomes a
+    forced "review" regardless of what the agent does next.
+    """
+    base = max(4, path_len + 2 * max(helpers_count, 1) + 2)
+    return base + rejections
 
 
 def _normalize_report_dict(data: dict) -> dict:
@@ -526,9 +575,12 @@ def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[Ca
     def after_tools(state: AgentState) -> Literal["agent", "report"]:
         if _verdict_accepted(state["messages"]):
             return "report"
-        if _verdict_reject_count(state["messages"]) >= 2:
+        rejections = _verdict_reject_count(state["messages"])
+        if rejections >= 3:
             return "report"
-        if _count_tool_messages(state["messages"]) >= _max_tool_budget(path_len):
+        helpers_count = len(case.helpers) if case is not None else 0
+        budget = _max_tool_budget(path_len, helpers_count, rejections)
+        if _count_tool_messages(state["messages"]) >= budget:
             return "report"
         return "agent"
 

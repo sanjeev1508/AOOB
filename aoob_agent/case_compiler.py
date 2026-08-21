@@ -264,6 +264,7 @@ class IndexedObject:
     is_pointer: bool
     location: str
     parse_note: Optional[str] = None
+    raw_declaration_text: str = ""
 
 
 @dataclass
@@ -301,6 +302,7 @@ class CaseFile:
     operand_scope_at_alarm: str
     indexed_object: IndexedObject
     helpers: list[str] = field(default_factory=list)
+    write_helpers: list[str] = field(default_factory=list)
     path: list[PathStep] = field(default_factory=list)
     gaps: list[str] = field(default_factory=list)
     extra_callers: list[str] = field(default_factory=list)
@@ -368,7 +370,19 @@ class CaseFile:
             f"Operand: {self.operand_symbol}  scope_at_alarm={self.operand_scope_at_alarm}",
         ]
         if self.helpers:
-            lines.append("Helpers in index expression: " + ", ".join(self.helpers))
+            lines.append("Helpers available to inspect(): " + ", ".join(self.helpers))
+        if self.write_helpers:
+            lines.append(
+                "Of those, these mutate the operand before the alarm access and "
+                "MUST be inspected before a true/false verdict: "
+                + ", ".join(self.write_helpers)
+            )
+        if self.indexed_object.raw_declaration_text:
+            lines.append(
+                "Indexed object has a declaration/initializer available via "
+                "inspect_declaration() — use it if a guard's truth depends on "
+                "a specific slot's contents (e.g. a sentinel entry)."
+            )
         lines.append(self.path_summary())
         if self.gaps:
             lines.append("Gaps: " + ", ".join(self.gaps))
@@ -430,6 +444,53 @@ def _infer_scope(
     return "unknown"
 
 
+def _find_operand_mutating_calls(
+    store: DataStore,
+    *,
+    function_name: str,
+    anchor_line: Optional[int],
+    operand_root: str,
+    exclude: set[str],
+) -> list[str]:
+    """Callees, inside the alarm function, passed the operand (often as &op).
+
+    callees_in_expression(index_expr) only sees calls written directly inside
+    the subscript, e.g. Foo[Reader(checkword)]. It misses calls elsewhere in
+    the same function body that mutate the operand in place before later
+    loop iterations reuse it, e.g. `Update(&checkword, core, tsk);` inside
+    the same while-loop that later re-reads `Foo[Reader(checkword)]`. Those
+    calls are exactly the ones that decide whether the index can ever exceed
+    the array's capacity, so they must be inspectable (and, for true/false
+    verdicts, inspected) even though they never appear in the index text.
+    """
+    if not function_name or not operand_root:
+        return []
+    start, end = None, None
+    if anchor_line is not None:
+        _fn, start, end = store.find_enclosing_function(anchor_line)
+    if start is None or end is None:
+        span = store.function_span(function_name, near_line=anchor_line)
+        if not span:
+            return []
+        start, end = span
+    found: list[str] = []
+    seen: set[str] = set()
+    for _ln, text in store.get_source_slice(start, end):
+        if not token_in_text(text, operand_root):
+            continue
+        for callee in callees_from_text(text):
+            if (
+                not callee
+                or callee in _SKIP_IDENT
+                or callee in exclude
+                or callee in seen
+            ):
+                continue
+            seen.add(callee)
+            found.append(callee)
+    return found
+
+
 def _lookup_object(store: DataStore, name: str) -> IndexedObject:
     key = clean_indexed_object(sanitize_symbol(name))
     if not key or key == "*()":
@@ -466,6 +527,7 @@ def _lookup_object(store: DataStore, name: str) -> IndexedObject:
             is_pointer=is_ptr,
             location=getattr(decl, "location", "") if decl else "",
             parse_note=pnote,
+            raw_declaration_text=getattr(decl, "raw_declaration_text", "") if decl else "",
         )
 
     info = store.resolve_declaration_lookup(key)
@@ -1017,11 +1079,20 @@ def compile_case(store: DataStore, order_id: int) -> CaseFile:
     if not operand:
         operand = index_expr or indexed_name
 
-    helpers = [
+    index_reader_helpers = [
         h
         for h in callees_in_expression(index_expr)
         if h != operand and h != obj.name
     ]
+    operand_root = sanitize_symbol(operand).split(".", 1)[0]
+    write_helpers = _find_operand_mutating_calls(
+        store,
+        function_name=alarm_fn,
+        anchor_line=alarm_line,
+        operand_root=operand_root,
+        exclude={obj.name, operand, *index_reader_helpers},
+    ) if operand_root else []
+    helpers = list(dict.fromkeys([*index_reader_helpers, *write_helpers]))
     gaps: list[str] = []
     if not indexed_name:
         gaps.append("index_unparsed")
@@ -1078,6 +1149,7 @@ def compile_case(store: DataStore, order_id: int) -> CaseFile:
         operand_scope_at_alarm=scope,
         indexed_object=obj,
         helpers=helpers,
+        write_helpers=write_helpers,
         path=path,
         gaps=uniq_gaps,
         extra_callers=extra_callers,

@@ -209,6 +209,44 @@ def inspect(function_name: str) -> str:
 
 
 @tool
+def inspect_declaration(symbol_name: str) -> str:
+    """Open the declaration/initializer for the indexed object or operand.
+
+    Use this when a guard's truth depends on the literal contents of a
+    specific array slot or struct field (e.g. "is index N always the
+    sentinel entry?") rather than on control flow. Only the indexed object,
+    the operand, and symbols named in an extracted guard are resolvable —
+    this is not a free lookup of every global in the translation unit.
+    """
+    session = get_session()
+    name = (symbol_name or "").strip()
+    if not session.can_inspect_declaration(name):
+        return _dump(
+            {
+                "error": (
+                    f"{name!r} is not a declaration this case can resolve. "
+                    f"Try the indexed object ({session.case.indexed_object.name!r}) "
+                    f"or the operand ({session.case.operand_symbol!r})."
+                ),
+            }
+        )
+    store = _store()
+    decl = store.get_declaration(name)
+    if decl is None:
+        return _dump({"error": f"No declaration found for {name!r}."})
+    return _dump(
+        {
+            "symbol": name,
+            "declared_type": decl.declared_type,
+            "array_size": decl.array_size,
+            "is_pointer": decl.is_pointer,
+            "location": decl.location,
+            "raw_declaration_text": decl.raw_declaration_text,
+        }
+    )
+
+
+@tool
 def submit_verdict(
     classification: str,
     comment: str,
@@ -240,8 +278,37 @@ def submit_verdict(
         conf = "medium"
 
     obj = session.case.indexed_object
-    size_unknown = obj.array_size is None
-    if cls in {"true", "false"} and size_unknown:
+    if cls == "review" and obj.array_size is not None:
+        claims_size_unknown = any(
+            phrase in (comment or "").lower()
+            for phrase in ("declared size", "array's size", "size of the", "size and")
+        ) and any(
+            phrase in (comment or "").lower()
+            for phrase in ("unknown", "insufficient", "not provide", "no size")
+        )
+        if claims_size_unknown:
+            session.review_contradiction_rejections = (
+                getattr(session, "review_contradiction_rejections", 0) + 1
+            )
+            return _dump(
+                {
+                    "accepted": False,
+                    "error": (
+                        f"declared_size is {obj.array_size} for "
+                        f"{obj.name!r} — it was in the get_window/inspect "
+                        "output you already received, and in the case brief. "
+                        "review because 'size is unknown' contradicts the "
+                        "evidence already in this conversation. Re-read the "
+                        "case brief's Indexed object line, or the guards, "
+                        "and either classify against the size that's actually "
+                        "there or state a different basis for review."
+                    ),
+                    "declared_size": obj.array_size,
+                }
+            )
+
+
+    if cls in {"true", "false"} and obj.array_size is None:
         session.size_unknown_retries += 1
         return _dump(
             {
@@ -254,6 +321,27 @@ def submit_verdict(
                 "case_gaps": list(session.case.gaps),
             }
         )
+
+    if cls in {"true", "false", "review"}:
+        pending = session.pending_write_helpers()
+        if pending:
+            session.write_gate_rejections += 1
+            return _dump(
+                {
+                    "accepted": False,
+                    "error": (
+                        "This operand is written before the alarm access by a "
+                        f"function not yet inspected: {pending[0]}. Call "
+                        "inspect() on it first — even for a review verdict, "
+                        "the attempt itself is required: if the body turns "
+                        "out to be unresolvable, inspect() will say so and "
+                        "review becomes submittable. Naming a mutator helper "
+                        "in your comment without calling inspect() on it "
+                        "isn't the same as checking it."
+                    ),
+                    "pending_write_helpers": pending,
+                }
+            )
 
     verdict = {
         "classification": cls,
@@ -270,13 +358,6 @@ TOOLS = [
     get_window,
     move_window,
     inspect,
+    inspect_declaration,
     submit_verdict,
 ]
-
-
-
-
-
-
-
-
