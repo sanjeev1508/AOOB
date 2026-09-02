@@ -21,19 +21,37 @@ clears human labels into `Full_alarms.csv`. Locations look like `file:line.col-c
 
 Python 3.11+ (tested 3.13). `py -3.13 -m pip install -r requirements.txt`
 
-`.env`:
+`.env` (never commit this file; it contains credentials):
 
 ```env
-AOOB_LLM_CHOOSED=nvidia        # local | network | nvidia  (honored; not a hint)
+# Tool calls and intermediate investigation reasoning
+AOOB_TOOL_LLM_CHOOSED=network  # local | network | nvidia | bosch
 
-# Optional override (default: nvidia/nemotron-3.5-lightning-30b-a3b)
-# NVIDIA_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
-NVIDIA_API_KEY=nvapi-...
+# Final classification/report generation
+AOOB_CLASSIFY_LLM_CHOOSED=bosch # local | network | nvidia | bosch
 
 OLLAMA_LOCAL_MODEL=qwen3:14b
 OLLAMA_LOCAL_BASE_URL=http://127.0.0.1:11434
+OLLAMA_NETWORK_MODEL=gemma4:26b
+OLLAMA_NETWORK_BASE_URL=http://your-network-ollama-host:8503
 OLLAMA_TIMEOUT=180
+
+# NVIDIA (when either role is set to nvidia)
+NVIDIA_API_KEY=nvapi-...
+# NVIDIA_MODEL=nvidia/nemotron-3.5-lightning-30b-a3b
+
+# Bosch AOAI Model Farm (when either role is set to bosch)
+MODEL_FARM_API_KEY=...
+BOSCH_BASE_URL=https://aoai-farm.bosch-temp.com/api/openai/deployments/<deployment>
+BOSCH_MODEL=gpt-5.6-luna
+BOSCH_API_VERSION=2024-05-01-preview
+BOSCH_TIMEOUT=180
 ```
+
+`AOOB_TOOL_LLM_CHOOSED` controls the model that calls investigation tools and performs
+intermediate reasoning. `AOOB_CLASSIFY_LLM_CHOOSED` controls the separate model that
+produces the final classification. The legacy `AOOB_LLM_CHOOSED` variable is still
+accepted as a fallback for both roles.
 
 ## Run
 
@@ -58,10 +76,11 @@ Send on the UI: highlight paints the compiled path on the CF graph; SSE runs the
 Order id
   → compile_case (no LLM): object, operand, origin→alarm path,
                             helpers, Python-extracted guards, gaps
-  → LLM: case brief in the first human message
+  → tool/reasoning LLM: case brief in the first human message
          get_window / move_window / inspect / inspect_declaration
          (each open returns the complete function or declaration)
   → submit_verdict: true | false | review
+  → classification LLM: final classification from the gathered evidence
   → report JSON (classification / comment / confidence)
 ```
 
@@ -81,20 +100,23 @@ The `cf_viz` UI's live tool-result preview (SSE) sizes its cap to the tool: `get
 
 ## Config
 
-| Variable                             | Meaning                                      |
-| ------------------------------------ | -------------------------------------------- |
-| `AOOB_LLM_CHOOSED`                   | `local` / `network` / `nvidia`               |
-| `OLLAMA_LOCAL_MODEL` / `_BASE_URL`   | Local Ollama                                 |
-| `OLLAMA_NETWORK_MODEL` / `_BASE_URL` | Remote Ollama                                |
-| `OLLAMA_NUM_CTX`                     | Context size (default 16384)                 |
-| `NVIDIA_API_KEY` / `NVIDIA_MODEL`    | NVIDIA backend                               |
-| `OLLAMA_TIMEOUT` / `NVIDIA_TIMEOUT`  | Seconds (default 300)                        |
+| Variable                                      | Meaning                                                   |
+| --------------------------------------------- | --------------------------------------------------------- |
+| `AOOB_TOOL_LLM_CHOOSED`                      | Tool/reasoning source: `local` / `network` / `nvidia` / `bosch` |
+| `AOOB_CLASSIFY_LLM_CHOOSED`                  | Final classification source: `local` / `network` / `nvidia` / `bosch` |
+| `AOOB_LLM_CHOOSED`                            | Legacy fallback for both role-specific source variables |
+| `OLLAMA_LOCAL_MODEL` / `_BASE_URL`            | Local Ollama                                              |
+| `OLLAMA_NETWORK_MODEL` / `_BASE_URL`          | Remote Ollama                                             |
+| `OLLAMA_NUM_CTX`                              | Context size (default 16384)                              |
+| `NVIDIA_API_KEY` / `NVIDIA_MODEL`             | NVIDIA backend                                            |
+| `MODEL_FARM_API_KEY` / `BOSCH_*`              | Bosch AOAI Model Farm backend                             |
+| `OLLAMA_TIMEOUT` / `NVIDIA_TIMEOUT` / `BOSCH_TIMEOUT` | Backend request timeout in seconds (default 300) |
 
 ## Troubleshooting
 
 | Symptom              | Fix                                                      |
 | -------------------- | -------------------------------------------------------- |
-| `No LLM configured`  | Set `AOOB_LLM_CHOOSED` + Ollama vars or `NVIDIA_API_KEY` |
+| `No LLM configured`  | Set the role-specific source variable and its backend credentials |
 | Alarm not found      | Check `Full_alarms.csv`; try `1112` vs `1,112`           |
 | Human labels leaking | Re-run `data\convert.py`                                 |
 | UI stale             | Hard-refresh; restart `--serve` after Python changes     |

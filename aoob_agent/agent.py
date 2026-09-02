@@ -156,9 +156,18 @@ def load_env(project_root: Path) -> None:
     load_dotenv(project_root / ".env", override=False)
 
 
-def llm_choice_mode() -> Optional[str]:
-    raw = (os.getenv("AOOB_LLM_CHOOSED") or os.getenv("AOOB_LLM_CHOOSE") or "").strip().lower()
-    return raw if raw in {"local", "network", "nvidia"} else None
+LLMRole = Literal["tool", "classify", "planner", "report"]
+
+
+def llm_choice_mode(role: LLMRole = "tool") -> Optional[str]:
+    role_env = "AOOB_CLASSIFY_LLM_CHOOSED" if role in {"classify", "report"} else "AOOB_TOOL_LLM_CHOOSED"
+    raw = (
+        os.getenv(role_env)
+        or os.getenv("AOOB_LLM_CHOOSED")
+        or os.getenv("AOOB_LLM_CHOOSE")
+        or ""
+    ).strip().lower()
+    return raw if raw in {"local", "network", "nvidia", "bosch"} else None
 
 
 def _local_ollama_model_name() -> str:
@@ -174,8 +183,8 @@ def _network_ollama_model_name() -> str:
     return (os.getenv("OLLAMA_NETWORK_MODEL") or "").strip()
 
 
-def ollama_base_url(mode: Optional[str] = None) -> str:
-    selected = mode or llm_choice_mode()
+def ollama_base_url(mode: Optional[str] = None, role: LLMRole = "tool") -> str:
+    selected = mode or llm_choice_mode(role)
     if selected == "network":
         return (
             os.getenv("OLLAMA_NETWORK_BASE_URL")
@@ -191,8 +200,8 @@ def ollama_base_url(mode: Optional[str] = None) -> str:
     ).rstrip("/")
 
 
-def ollama_model_name() -> str:
-    selected = llm_choice_mode()
+def ollama_model_name(role: LLMRole = "tool") -> str:
+    selected = llm_choice_mode(role)
     if selected == "local":
         return _local_ollama_model_name() or (os.getenv("OLLAMA_MODEL") or "").strip()
     if selected == "network":
@@ -204,18 +213,18 @@ def ollama_model_name() -> str:
     )
 
 
-def ollama_configured() -> bool:
-    return bool(ollama_model_name())
+def ollama_configured(role: LLMRole = "tool") -> bool:
+    return bool(ollama_model_name(role))
 
 
 def nvidia_configured() -> bool:
     return bool((os.getenv("NVIDIA_API_KEY") or "").strip())
 
 
-def _ollama_available(timeout: Optional[float] = None) -> bool:
-    if not ollama_configured():
+def _ollama_available(timeout: Optional[float] = None, role: LLMRole = "tool") -> bool:
+    if not ollama_configured(role):
         return False
-    base = ollama_base_url()
+    base = ollama_base_url(role=role)
     request = Request(f"{base}/api/tags", headers={"Accept": "application/json"})
     host = (urlparse(base).hostname or "").strip().lower()
     try:
@@ -259,47 +268,51 @@ def _is_ollama_runtime_error(exc: Exception) -> bool:
     )
 
 
-def using_ollama() -> bool:
+def using_ollama(role: LLMRole = "tool") -> bool:
     override = llm_backend_override()
-    selected = llm_choice_mode()
+    selected = llm_choice_mode(role)
     if override == "nvidia" or selected == "nvidia":
         return False
+    if selected == "bosch":
+        return False
     if selected in {"local", "network"} or override == "ollama":
-        if not ollama_configured():
+        if not ollama_configured(role):
             raise RuntimeError(
                 f"AOOB_LLM_CHOOSED={selected or 'ollama'} but no Ollama model is set. "
                 "Set OLLAMA_LOCAL_MODEL or OLLAMA_NETWORK_MODEL."
             )
         return True
-    return ollama_configured() and _ollama_available()
+    return ollama_configured(role) and _ollama_available(role=role)
 
 
 def resolve_model_name(
     model: Optional[str] = None,
     use_ollama: Optional[bool] = None,
-    role: Literal["planner", "report"] = "report",
+    role: LLMRole = "tool",
 ) -> str:
-    del role
     if model:
         return model
     if use_ollama is None:
-        use_ollama = using_ollama()
+        use_ollama = using_ollama(role)
     if use_ollama:
-        return ollama_model_name()
+        return ollama_model_name(role)
+    if llm_choice_mode(role) == "bosch":
+        return os.getenv("BOSCH_MODEL", DEFAULT_BOSCH_MODEL).strip()
     return os.getenv("NVIDIA_MODEL", DEFAULT_NVIDIA_MODEL) or DEFAULT_NVIDIA_MODEL
 
 
-def llm_backend_label(role: Literal["planner", "report"] = "report") -> str:
-    kind = "Ollama" if using_ollama() else "NVIDIA"
+def llm_backend_label(role: LLMRole = "tool") -> str:
+    source = llm_choice_mode(role)
+    kind = "Ollama" if using_ollama(role) else ("Bosch" if source == "bosch" else "NVIDIA")
     return f"{kind} ({resolve_model_name(role=role)})"
 
 
 def planner_backend_label() -> str:
-    return llm_backend_label()
+    return llm_backend_label("tool")
 
 
 def report_backend_label() -> str:
-    return llm_backend_label()
+    return llm_backend_label("classify")
 
 
 def _log(msg: str) -> None:
@@ -309,23 +322,26 @@ def _log(msg: str) -> None:
 def build_llm(
     model: Optional[str] = None,
     backend: Optional[str] = None,
-    role: Literal["planner", "report"] = "report",
+    role: LLMRole = "tool",
 ) -> Any:
     if backend == "ollama":
         use_ollama = True
     elif backend == "nvidia":
         use_ollama = False
     else:
-        use_ollama = using_ollama()
+        use_ollama = using_ollama(role)
     name = resolve_model_name(model, use_ollama=use_ollama, role=role)
-    timeout = float(os.getenv("OLLAMA_TIMEOUT" if use_ollama else "NVIDIA_TIMEOUT", "300"))
+    timeout_name = "OLLAMA_TIMEOUT" if use_ollama else (
+        "BOSCH_TIMEOUT" if llm_choice_mode(role) == "bosch" else "NVIDIA_TIMEOUT"
+    )
+    timeout = float(os.getenv(timeout_name, "300"))
     if use_ollama:
         from langchain_ollama import ChatOllama
 
-        base_url = ollama_base_url()
+        base_url = ollama_base_url(role=role)
         num_ctx = int(os.getenv("OLLAMA_NUM_CTX", "16384"))
         _log(
-            f"[llm] choosed={llm_choice_mode() or 'auto'} backend=ollama "
+            f"[llm] choosed={llm_choice_mode(role) or 'auto'} role={role} backend=ollama "
             f"model={name} base_url={base_url} timeout={timeout}s"
         )
         return ChatOllama(
@@ -336,12 +352,31 @@ def build_llm(
             num_predict=2048,
             client_kwargs={"timeout": timeout},
         )
+    if llm_choice_mode(role) == "bosch":
+        from langchain_openai import ChatOpenAI
+
+        api_key = os.getenv("MODEL_FARM_API_KEY")
+        if not api_key:
+            raise RuntimeError("Set MODEL_FARM_API_KEY for the Bosch model farm.")
+        base_url = os.getenv("BOSCH_BASE_URL", DEFAULT_BOSCH_BASE_URL).rstrip("/")
+        api_version = os.getenv("BOSCH_API_VERSION", DEFAULT_BOSCH_API_VERSION)
+        _log(f"[llm] choosed=bosch role={role} model={name} timeout={timeout}s")
+        return ChatOpenAI(
+            model=name,
+            api_key=api_key,
+            base_url=base_url,
+            timeout=timeout,
+            temperature=0.1,
+            max_tokens=2048,
+            default_query={"api-version": api_version},
+            default_headers={BOSCH_HEADER_NAME: api_key},
+        )
     api_key = os.getenv("NVIDIA_API_KEY")
     if not api_key:
         raise RuntimeError("Set NVIDIA_API_KEY or a reachable Ollama model in .env.")
     from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
-    _log(f"[llm] choosed={llm_choice_mode() or 'auto'} backend=nvidia model={name} timeout={timeout}s")
+    _log(f"[llm] choosed={llm_choice_mode(role) or 'auto'} role={role} backend=nvidia model={name} timeout={timeout}s")
     extra: dict[str, Any] = {}
     max_tokens = 2048
     if "nemotron-3.5" in name.lower() or "lightning" in name.lower():
@@ -399,10 +434,25 @@ def _tool_names_used(messages: list) -> set[str]:
 
 
 def _parse_tool_json(content: str) -> Optional[dict]:
+    content = (content or "").strip()
+    if content.startswith("```"):
+        lines = content.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        content = "\n".join(lines).strip()
     try:
         data = json.loads(content)
         return data if isinstance(data, dict) else None
-    except Exception:  # noqa: BLE001
+    except json.JSONDecodeError:
+        start, end = content.find("{"), content.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                data = json.loads(content[start : end + 1])
+                return data if isinstance(data, dict) else None
+            except json.JSONDecodeError:
+                pass
         return None
 
 
@@ -621,8 +671,8 @@ def _human_brief(order_id: int, case: CaseFile) -> str:
 
 def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[CaseFile] = None):
     bind_store(store)
-    llm = build_llm(model=model)
-    current_backend = "ollama" if using_ollama() else "nvidia"
+    llm = build_llm(model=model, role="tool")
+    current_backend = llm_choice_mode("tool") or ("ollama" if using_ollama("tool") else "nvidia")
 
     def _try_runtime_fallback(exc: Exception) -> bool:
         nonlocal llm, current_backend
@@ -806,7 +856,36 @@ def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[Ca
                 "micro_window_used": False,
                 "safety_ceiling_hit": bool(state.get("force_review")),
             }
-        data = _fill_report_from_case(_normalize_report_dict(data), active, state["messages"], store)
+        # The tool model gathers evidence; a separate classification model owns the final label.
+        classifier = build_llm(role="classify")
+        evidence = "\n\n".join(
+           f"{type(message).__name__}: {_message_text(message) or str(getattr(message, 'content', ''))}"
+           for message in state["messages"]
+        )
+        classification_prompt = (
+           "Classify this Astrée AOOB investigation using the evidence below. "
+           "Return ONLY JSON with keys classification (false, true, true (low), undecided, or review), "
+           "comment, confidence (low/medium/high), summary, human_tag_pattern, reason_for_review. "
+           "Do not invent evidence and use review when the evidence is insufficient.\n\n"
+           f"Case:\n{active.brief()}\n\nInvestigation evidence:\n{evidence}"
+        )
+        classified = classifier.invoke(
+            [
+                SystemMessage(
+                    content=(
+                        "You are the final AOOB alarm classifier. Return only a valid JSON object. "
+                        "Base the classification exclusively on the supplied investigation evidence."
+                    )
+                ),
+                HumanMessage(content=classification_prompt),
+            ]
+        )
+        classification_data = _parse_tool_json(_message_text(classified))
+        if classification_data is None:
+           raise ValueError("Classification model returned invalid JSON.")
+        data = _fill_report_from_case(
+           _normalize_report_dict(classification_data), active, state["messages"], store
+        )
 
         try:
             report = AlarmInvestigationReport.model_validate(data)
@@ -956,7 +1035,9 @@ def stream_investigate(order_id: int, store: DataStore, model: Optional[str] = N
         yield {
             "type": "agent_input",
             "data": {
-                "llm": llm_backend_label(),
+                "llm": llm_backend_label("tool"),
+                "llm_tool": llm_backend_label("tool"),
+                "llm_classify": llm_backend_label("classify"),
                 "system_prompt": SYSTEM_PROMPT,
                 "human_message": human_content,
                 "case_brief": case.brief(),
@@ -986,7 +1067,13 @@ def stream_investigate(order_id: int, store: DataStore, model: Optional[str] = N
             "force_review": False,
             "counterargument_pending": False,
         }
-        yield {"type": "status", "message": f"Calling {llm_backend_label()}…"}
+        yield {
+            "type": "status",
+            "message": (
+                f"Calling tool/reasoning {llm_backend_label('tool')}; "
+                f"final classification uses {llm_backend_label('classify')}…"
+            ),
+        }
         final_report = None
         recursion_limit = max(64, 2 * (SAFETY_CEILING + 4) + 8)
         for update in agent.stream(
