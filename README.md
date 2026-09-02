@@ -111,6 +111,8 @@ The `cf_viz` UI's live tool-result preview (SSE) sizes its cap to the tool: `get
 | `NVIDIA_API_KEY` / `NVIDIA_MODEL`             | NVIDIA backend                                            |
 | `MODEL_FARM_API_KEY` / `BOSCH_*`              | Bosch AOAI Model Farm backend                             |
 | `OLLAMA_TIMEOUT` / `NVIDIA_TIMEOUT` / `BOSCH_TIMEOUT` | Backend request timeout in seconds (default 300) |
+| `AOOB_LLM_BACKEND`                            | Optional global `ollama` / `nvidia` override for both roles |
+| `AOOB_OLLAMA_RUNTIME_FALLBACK`               | Set `1` to fall back from Ollama to NVIDIA on runtime connection errors |
 
 ## Troubleshooting
 

@@ -153,7 +153,7 @@ class AgentState(TypedDict):
 
 
 def load_env(project_root: Path) -> None:
-    load_dotenv(project_root / ".env", override=False)
+    load_dotenv(project_root / ".env", override=True)
 
 
 LLMRole = Literal["tool", "classify", "planner", "report"]
@@ -269,6 +269,11 @@ def _is_ollama_runtime_error(exc: Exception) -> bool:
 
 
 def using_ollama(role: LLMRole = "tool") -> bool:
+    if (os.getenv("AOOB_LLM_BACKEND") or "").strip():
+        _log(
+            "[llm] warning: AOOB_LLM_BACKEND overrides the role-specific "
+            f"{'classification' if role in {'classify', 'report'} else 'tool'} backend"
+        )
     override = llm_backend_override()
     selected = llm_choice_mode(role)
     if override == "nvidia" or selected == "nvidia":
@@ -833,6 +838,9 @@ def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[Ca
                 "micro_window_used": accepted.get("micro_window_used", False),
                 "safety_ceiling_hit": accepted.get("safety_ceiling_hit", False),
             }
+            data = _fill_report_from_case(
+                _normalize_report_dict(data), active, state["messages"], store
+            )
         else:
             force_reason = "Agent did not submit an accepted verdict."
             try:
@@ -856,36 +864,42 @@ def build_agent(store: DataStore, model: Optional[str] = None, case: Optional[Ca
                 "micro_window_used": False,
                 "safety_ceiling_hit": bool(state.get("force_review")),
             }
-        # The tool model gathers evidence; a separate classification model owns the final label.
-        classifier = build_llm(role="classify")
-        evidence = "\n\n".join(
-           f"{type(message).__name__}: {_message_text(message) or str(getattr(message, 'content', ''))}"
-           for message in state["messages"]
-        )
-        classification_prompt = (
-           "Classify this Astrée AOOB investigation using the evidence below. "
-           "Return ONLY JSON with keys classification (false, true, true (low), undecided, or review), "
-           "comment, confidence (low/medium/high), summary, human_tag_pattern, reason_for_review. "
-           "Do not invent evidence and use review when the evidence is insufficient.\n\n"
-           f"Case:\n{active.brief()}\n\nInvestigation evidence:\n{evidence}"
-        )
-        classified = classifier.invoke(
-            [
-                SystemMessage(
-                    content=(
-                        "You are the final AOOB alarm classifier. Return only a valid JSON object. "
-                        "Base the classification exclusively on the supplied investigation evidence."
-                    )
-                ),
-                HumanMessage(content=classification_prompt),
-            ]
-        )
-        classification_data = _parse_tool_json(_message_text(classified))
-        if classification_data is None:
-           raise ValueError("Classification model returned invalid JSON.")
-        data = _fill_report_from_case(
-           _normalize_report_dict(classification_data), active, state["messages"], store
-        )
+            digest_parts = [f"Case:\n{active.brief()}"]
+            for message in state["messages"]:
+                if not isinstance(message, ToolMessage):
+                    continue
+                if getattr(message, "name", None) not in {"run_simulation", "submit_verdict"}:
+                    continue
+                digest_parts.append(
+                    f"{message.name}:\n{str(message.content)}"
+                )
+            classifier = build_llm(role="classify")
+            classified = classifier.invoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "You are the final AOOB alarm classifier. Return only a valid JSON object. "
+                            "Base the classification exclusively on the supplied investigation evidence."
+                        )
+                    ),
+                    HumanMessage(
+                        content=(
+                            "Classify this Astrée AOOB investigation. Return ONLY JSON with keys "
+                            "classification (false, true, true (low), undecided, or review), comment, "
+                            "confidence (low/medium/high), summary, human_tag_pattern, reason_for_review. "
+                            "Do not invent evidence and use review when insufficient.\n\n"
+                            + "\n\n".join(digest_parts)
+                        )
+                    ),
+                ]
+            )
+            classification_data = _parse_tool_json(_message_text(classified))
+            if classification_data is None:
+                raise ValueError("Classification model returned invalid JSON.")
+            data = classification_data
+            data = _fill_report_from_case(
+                _normalize_report_dict(data), active, state["messages"], store
+            )
 
         try:
             report = AlarmInvestigationReport.model_validate(data)

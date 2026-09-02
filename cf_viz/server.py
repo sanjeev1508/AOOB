@@ -62,7 +62,7 @@ def _ensure_loaded() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_dotenv(ROOT / ".env")
+    load_dotenv(ROOT / ".env", override=True)
     data_dir = Path(os.getenv("AOOB_DATA_DIR", str(DEFAULT_DATA)))
     graph_json = Path(os.getenv("AOOB_GRAPH_JSON", str(DEFAULT_GRAPH_JSON)))
     process = os.getenv("AOOB_PROCESS") or None

@@ -28,7 +28,7 @@ def _store() -> DataStore:
 
 
 def _dump(payload: dict) -> str:
-    return json.dumps(payload, indent=2)
+    return json.dumps(payload, separators=(",", ":"))
 
 
 def _record_confidence(confidence_so_far: str = "") -> None:
